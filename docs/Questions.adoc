@@ -1,0 +1,24 @@
+= Question
+
+- Data storage: log structured (append only) versus update-in-place?
+
+-- In a column store, update-in-place for point writes inevitably results in write amplification as the ratio between the cell size (e.g. 4 bytes) and write quantum (4096 these days)
+This may not apply if lower levels of the system are doing log structuring, e.g. change buffers in a SSD.
+An easier sell for main memories with a smaller block size, but main memory block sizes are increasing.
+
+-- Log structure makes snapshot isolation easier and improves write amplification, going with it.
+
+- Should we support multiversioning at all?
+
+-- "No" breaks SQL transactions (cannot do an UPDATE without COMMIT)
+
+-- Log structure makes this fairly easy, do it
+
+.Decisions
+- Resolved: A column must always be represented in memory or stably (post-checkpoint) on disk as a small number of type-homogenous arrays.
+This minimizes cache load overhead and maximizes the ability to use bandwidth and vector operations.
+
+- Resolved: Vector data shall be represented as "fragments".
+Near-free concatenation is a powerful enabler for multithreading and encourages coding patters that are also good for cancellation.
+
+- Resolved: Log structure

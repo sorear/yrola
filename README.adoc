@@ -1,0 +1,3 @@
+= Yrola - a (design for an) open source scale-free streaming analytical database
+
+It's heavily inspired by MonetDB, but with JIT-compiled code, immutable headless BATs, log-structured storage, and substantially different multithread factoring,

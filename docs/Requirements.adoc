@@ -1,0 +1,70 @@
+= Yrola versus MonetDB
+
+Yrola grows out of experience implementing a clustered multitenant analytics system with Monet.
+
+== Requirements
+
+|===
+|Name|Category|In MonetDB?|Prio{empty}footnote:[4=Repeated crises to not have, 3=Scary to not have, 2=Strong goal, 1=Wishlist]|Description
+
+|Fast commit
+|Perf/Latency
+|Yes
+|2
+|Write transactions must be a single append and fsync to a WAL.
+
+|Read availability
+|Perf/Latency
+|Yes
+|2
+|Read and write transactions must not block each other.  (But we'll accept it for short I/O ops on separate tables).
+
+|Read availability 2
+|Perf/Latency
+|No
+|3
+|Lengthy "checkpoint" type operations must not block reads or writes.  In MonetDB, checkpoints are done with the store lock held and only if store_nr_active=0.
+
+|Write amplification
+|Perf/Throughput
+|No
+|4
+|Inclusive of all future checkpoints, inserting or updating a row must cause Õ(1) physical writes.  MonetDB fails this, most writes require table rebuilds (which happen with the store lock held, grr).
+
+|Physical backups
+|Safety
+|No
+|3
+|It should be possible to copy all data files out of a live database, possibly while holding a lock but without a server restart.
+
+|Query termination
+|Safety
+|No
+|3
+|KILL QUERY must work reliably.
+
+|Resource limits
+|Safety
+|No
+|3
+|A misbehaving query MUST NOT kill the server, the database must monitor memory and disk resources to avoid crises (issuing internal KILL QUERY).
+
+|Better durability 1
+|Safety
+|No
+|4
+|Observed MonetDB failure mode: spontaneous row duplication
+
+|Corruption robustness
+|Safety
+|No
+|4
+|If the server sees bad data on disk, it should disable access to the table in question but stay up pending administrator intervention.
+
+|Data types
+|Functionality
+|No
+|2
+|MonetDB types are quite limited because of the macro-based implementation strategy.
+Yrola baselines a LLVM-based runtime code generation to push the combinatorial explosion to runtime where it can be managed lazily.
+|===

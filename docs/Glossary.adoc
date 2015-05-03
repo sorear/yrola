@@ -1,0 +1,65 @@
+= Glossary
+
+fragment::
+A contiguous array of memory in which values are stored.
+The primitive unit of data generation.
+Associated with a type, possible format metadata (sorted?), and NUMA node location (includes CPU, because hey it might be cached).
+
+vector::
+The primitive unit of data persistence and that which is seen by the SQL engine.
+Composed of fragments, but the boundaries are not semantic and may be lost at any time.
+Created intact, although there may be "inchoate vector" objects in some part of the system.
+
+nursery::
+A 1TB section of thread-local address space where fragments are born.
+POSSIBLY OBSOLETE.
+
+microtask::
+A unit of scheduling, such as 1/16 of a join if the join is intended to be executed over 16 shards.
+Bound to a thread and may use a nursery.
+MAY JUST BE A PTHREAD.
+
+job::
+A unit of accounting.
+Has a priority and quotas; owns microtasks.
+
+partition::
+A rectangular (TODO: dynamic columns?) container for data which exists on one or more servers.
+May be replicated, details TBD.
+Composed at any given time of segments, which are kept in a segment table.
+
+server::
+A single Yrola process.
+
+segment table::
+A mutable data structure which defines the current contents of a partition as a collection of segments.
+Data is added to a partition by adding new (light) segments, which are merged asynchronously.
+Likely to be the locus of MVCC when relevant (this segment is valid from time T1 to T2).
+
+segment::
+An immutable rectangular collection of data.
+May be light (row-format, exists in memory and in the WAL) or promoted to full (real on-disk vectors) once large enough.
+Can contain new rows, tombstones, and possibly one or more dedicated update types.
+
+butterfly::
+A relational algebra operation which requires global data and therefore a communication round (between threads/NUMA zones or between servers).
+
+RA1::
+The initial SSA form of relational algebra which SQL is converted into and then optimized.
+There may be other distinctly different forms which are generated as part of a transform pipeline; if so they will get names RA2, etc.  TBD.
+
+table::
+A user-visible data container.
+References one or more partitions (including node references) and a scheme for dividing data.
+Data may be stored in multiple partitions for a form of indexing.
+
+recycling::
+Caching the result of relational operators.
+Especially useful for segment-level operations as segments are immutable.
+
+catalog::
+A set of tables which contains metadata for a collection of schema objects.
+Yrola can use multiple catalogs, even in one statement.
+Each catalog is a set of quite ordinary tables and be replicated and partitioned if too large.
+By default, user tables are created in a user catalog; to access the user catalog, a bootstrap catalog is provided implicitly by the server.
+Physical data storage is handled by per-server partition tables.
