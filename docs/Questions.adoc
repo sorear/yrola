@@ -1,24 +1,66 @@
 = Question
 
-- Data storage: log structured (append only) versus update-in-place?
+* Data storage: log structured (append only) versus update-in-place?
 
--- In a column store, update-in-place for point writes inevitably results in write amplification as the ratio between the cell size (e.g. 4 bytes) and write quantum (4096 these days)
+** In a column store, update-in-place for point writes inevitably results in write amplification as the ratio between the cell size (e.g. 4 bytes) and write quantum (4096 these days)
 This may not apply if lower levels of the system are doing log structuring, e.g. change buffers in a SSD.
 An easier sell for main memories with a smaller block size, but main memory block sizes are increasing.
 
--- Log structure makes snapshot isolation easier and improves write amplification, going with it.
+** Log structure makes snapshot isolation easier and improves write amplification, going with it.
 
-- Should we support multiversioning at all?
+* Should we support multiversioning at all?
 
--- "No" breaks SQL transactions (cannot do an UPDATE without COMMIT)
+** "No" breaks SQL transactions (cannot do an UPDATE without COMMIT)
 
--- Log structure makes this fairly easy, do it
+** Log structure makes this fairly easy, do it
+
+* Interaction between tombstoning and partitoning
+
+** Tombstones must be local to avoid very costly cluster-wide antijoins
+
+* Tombstone/segmentation method
+
+** Bag-of-rows methods
+
+*** VID approach: inserts carry an extra "vid" column, tombstones are in a sidecar segment which has only the VID
+
+**** Pro: reconstruction is a single standard antijoin after two free concats
+
+**** Con: Inserts are not concise (need vid), updates need 2 vids (one for the new ver, one to tombstone)
+
+*** Bag subtraction approach: the "vid" is the entire row
+
+**** Inserts are concise, updates require twice the data
+
+**** Con: Requires a novel "counted antijoin" for inserts and deletes of the same row to work
+
+**** Subtraction could use a collision-resistant hash function in some cases
+
+** Candidate key methods
+
+*** Tombstone + implicit update on same value for a candidate key
+
+**** Pro: quite concise
+
+**** Con: cannot pre-concat, requires a strange multi-input left merge join
+
+**** Could treat tombstones as updates that (perhaps implicitly) set a deleted bit, then they could be cleared out with a filter after a delete-agnostic merge join
+
+**** Could have narrow update segments for specific hot columns
+
+** May make sense to offer more than one of these.
+Related: Sorting of segments.
+
+* Strategic query planning shall be done at the top level.
+Delegated operations shall be relational algebra operations (including fusions) directed at a specific partition or superpartition.
+
+* Transactions shall support snapshot isolation and 2PL.
 
 .Decisions
-- Resolved: A column must always be represented in memory or stably (post-checkpoint) on disk as a small number of type-homogenous arrays.
+* Resolved: A column must always be represented in memory or stably (post-checkpoint) on disk as a small number of type-homogenous arrays.
 This minimizes cache load overhead and maximizes the ability to use bandwidth and vector operations.
 
-- Resolved: Vector data shall be represented as "fragments".
+* Resolved: Vector data shall be represented as "fragments".
 Near-free concatenation is a powerful enabler for multithreading and encourages coding patters that are also good for cancellation.
 
-- Resolved: Log structure
+* Resolved: Log structure

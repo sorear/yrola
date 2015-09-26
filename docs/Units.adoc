@@ -1,0 +1,11 @@
+= Functional Units
+
+"C++" versus "Lua" units?
+Units in/not in microtask context?
+Do either of these even make sense?
+
+== Safety-critical, non-accounted units
+
+These units can crash the server if they misbehave badly enough.
+
+

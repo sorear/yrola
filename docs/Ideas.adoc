@@ -1,19 +1,19 @@
 = Ideas
 
-- Query optimzation
+* Query optimzation
 
--- Operation fusion.
+** Operation fusion.
 
--- Distinguish operations based on concurrency behavior: "butterfly" versus "passthrough".
+** Distinguish operations based on concurrency behavior: "butterfly" versus "passthrough".
 Two butterflies generally cannot be merged.
 Null butterflies may be desired for rebalancing in some cases.
 
--- Try to use fusion to eliminate temporaries: significantly enhances log-structure mode and recycling.
+** Try to use fusion to eliminate temporaries: significantly enhances log-structure mode and recycling.
 
-- Clustering
+* Clustering
 
--- It's just another layer of butterflies.
+** It's just another layer of butterflies.
 Cache aware streaming design gives us an easy route to NUMA and distribution.
 
--- Special "non-atomic delayable batch UPSERT" transaction allows for updating a group of replicas efficiently.
+** Special "non-atomic delayable batch UPSERT" transaction allows for updating a group of replicas efficiently.
 Group commit for Paxos, or perhaps reconciliation.

@@ -1,0 +1,27 @@
+= Yrola Dataspace
+
+This is the persistence component.
+
+== Abstract features
+
+* Data model and API
+** The dataspace stores a small amount of memory resident *state* and some number of *fragments* which are byte arrays assumed to have high-latency sequential random access.
+** Fragments can be created and destroyed at any time.
+** State operations are subject to atomic commit to stable storage and occur in a definite order; there is a lock which must be held for all mutations of the state.
+** Fragments are only persistent if they are referenced by the state.
+
+* Types of dataspace
+** Persistent: has a WAL and fragment files
+** Temporary: No WAL, state exists in one version in memory.
+Fragments may be in files or anonymous memory.
+** Anonymous: Temporary and with no root directory so all fragments must be anonymous.
+
+* Assumptions that can be made about disk storage
+** KERNEL: All operations are atomic and stable once completed.
+Use this if you're more afraid of DB crashes than system crashes.
+** SQLITE3710: fsync does not lie, metadata and directory operations are atomic but unordered, incomplete writes destroy data only within the written-to region.
+** PESSIMISTIC: writes have 512b blast radius, fsync is not a barrier.
+Still assume atomic/non-blasty directory operations because working around that is ridiculous (it probably could be done with a user level blocking system a la ibdata).
+Non-barrier fsync means that backing-store deletes are never truly safe, but >1h delay should be good.
+
+
