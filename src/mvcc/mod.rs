@@ -7,7 +7,7 @@ use std::io::Cursor;
 use std::io::Read;
 use std::ops::Deref;
 use std::result::Result::{Ok};
-use std::sync::{Arc,RwLock,RwLockReadGuard};
+use std::sync::{Arc,RwLock};
 use std::{u32,u64};
 
 use byteorder::{NativeEndian,ByteOrder};
@@ -33,7 +33,7 @@ impl MVCC {
     }
 
     fn next_stamp(&self, bump: u64) -> u64 {
-        let mut st = self.current_stamp.write().unwrap();
+        let st = self.current_stamp.write().unwrap();
         let new = cmp::max(st.get(), bump) + 1;
         st.set(new);
         new
@@ -166,7 +166,7 @@ impl Transaction {
         // TODO interface is unnecessarily restricted, not all tables have vids
         let list_g = self.mvcc.attached.read().unwrap();
         let attach_g = try!(list_g.get(db_id as usize).ok_or(Error::DatabaseDetached)).read().unwrap();
-        let mut planks = try!(self.materialize_table(job, attach_g.deref(), table_id));
+        let planks = try!(self.materialize_table(job, attach_g.deref(), table_id));
 
         if planks.len() == 0 {
             return Err(corruption("modifying nonexistant table"));
@@ -184,7 +184,7 @@ impl Transaction {
 
         let mut segments = Vec::new();
         segments.push(LazyVector::Loaded {
-            vector: try!(TempVector::seq_u64_native(last_vid + 1, row_count).to_persistent())
+            vector: try!(TempVector::seq_u64_native(job, last_vid + 1, row_count).to_persistent())
         });
         let tombstone_count = try!(vids_to_delete.len());
         segments.push(LazyVector::Loaded { vector: try!(vids_to_delete.to_persistent()) });

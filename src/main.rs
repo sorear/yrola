@@ -9,6 +9,7 @@ mod mvcc;
 
 // TODO provide a central log mechanism
 // TODO provide a mechanism for corruption errors to trigger read only
+#[derive(Debug)]
 pub enum Error {
     // TODO Corruption errors frequently have less information than they could.  Audit
     Corruption { detail: String },
