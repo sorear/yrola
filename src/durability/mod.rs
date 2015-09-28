@@ -1,5 +1,5 @@
 //! The durability mechanism for Yrola
-use vector::Vector;
+use vector::PersistVector;
 use std::collections::HashMap;
 use ::{Result,Error};
 
@@ -9,9 +9,9 @@ pub trait DurabilityProvider {
     /// Given a file number that was previously added (possibly in a previous session), load it
     // TODO add a "prevents delete lock" and use it to shrink the critical section on this
     // TODO add
-    fn get_vector(&self, filenum: u64) -> Result<Vector>;
+    fn get_vector(&self, filenum: u64) -> Result<PersistVector>;
 
-    fn save_vector(&mut self, filenum: u64, data: &Vector);
+    fn save_vector(&mut self, filenum: u64, data: &PersistVector);
 
     fn del_vector(&mut self, filenum: u64);
 
@@ -33,7 +33,7 @@ pub trait DurabilityProvider {
 }
 
 pub struct NoneDurability {
-    files: HashMap<u64, Vector>,
+    files: HashMap<u64, PersistVector>,
     items: HashMap<u64, Vec<u8>>,
     next_file: u64,
     next_item: u64,
@@ -51,12 +51,12 @@ impl NoneDurability {
 }
 
 impl DurabilityProvider for NoneDurability {
-    fn get_vector(&self, filenum: u64) -> Result<Vector> {
+    fn get_vector(&self, filenum: u64) -> Result<PersistVector> {
         self.files.get(&filenum).cloned()
             .ok_or(Error::Corruption { detail: format!("Vector {} not found", filenum) })
     }
 
-    fn save_vector(&mut self, filenum: u64, data: &Vector) {
+    fn save_vector(&mut self, filenum: u64, data: &PersistVector) {
         self.files.insert(filenum, data.clone());
     }
 

@@ -15,7 +15,7 @@ use rmp;
 
 use ::{Result,Error,corruption};
 use durability::DurabilityProvider;
-use vector::Vector;
+use vector::{TempVector,PersistVector,JobRef};
 
 /// Yrola MVCC engine - one per process
 pub struct MVCC {
@@ -83,7 +83,8 @@ impl Attachment {
         self.provider.get_journal_items().values().map(|v| Plank::parse_bytes(v)).collect()
     }
 
-    fn materialize_column(&self, planks: &mut [Plank], column_index: u32) -> Result<Vector> {
+    fn materialize_column(&self, job: &JobRef, planks: &mut [Plank], column_index: u32)
+                          -> Result<TempVector> {
         // TODO this assumes the vid / ts / data layout
         if planks.len() == 0 {
             return Err(Error::Corruption { detail: "attempt to read from nonexistant table".to_string() });
@@ -91,27 +92,27 @@ impl Attachment {
         if planks[0].segments.len() < 2 || column_index as usize > planks[0].segments.len() - 2 {
             return Err(Error::Corruption { detail: "attempt to read out of range column".to_string() });
         }
-        let vid_merged = Vector::concat(&try!(planks.iter_mut()
-            .map(|p| p.segments[0].load(self)).collect()));
-        let ts_merged = Vector::concat(&try!(planks.iter_mut()
-            .map(|p| p.segments[1].load(self)).collect()));
-        let data_merged = Vector::concat(&try!(planks.iter_mut()
-            .map(|p| p.segments[(column_index as usize) + 2].load(self)).collect()));
+        let vid_merged = TempVector::concat(job, &try!(planks.iter_mut()
+            .map(|p| p.segments[0].load_bind(self, job)).collect()));
+        let ts_merged = TempVector::concat(job, &try!(planks.iter_mut()
+            .map(|p| p.segments[1].load_bind(self, job)).collect()));
+        let data_merged = TempVector::concat(job, &try!(planks.iter_mut()
+            .map(|p| p.segments[(column_index as usize) + 2].load_bind(self, job)).collect()));
         // TODO a multi-materialize would allow sharing the antijoin work
-        let ts_indices = try!(Vector::join_index(&vid_merged, &ts_merged));
-        Vector::index_antijoin(&data_merged, &ts_indices)
+        let ts_indices = TempVector::join_index(&vid_merged, &ts_merged);
+        Ok(TempVector::index_antijoin(&data_merged, &ts_indices))
     }
 
     // This is separate so that it can have a more efficient implementation (Not fully materializing)
-    fn point_query(&self, planks: &mut [Plank], lookup_column_index: u32,
+    fn point_query(&self, job: &JobRef, planks: &mut [Plank], lookup_column_index: u32,
                    lookup_column_value: &[u8], fetch_column_indices: &[u32])
-                   -> Result<Vec<Vector>> {
-        let lookup_col = try!(self.materialize_column(planks, lookup_column_index));
-        let indices = try!(Vector::point_index(&lookup_col, lookup_column_value));
+                   -> Result<Vec<TempVector>> {
+        let lookup_col = try!(self.materialize_column(job, planks, lookup_column_index));
+        let indices = TempVector::point_index(&lookup_col, lookup_column_value);
 
         fetch_column_indices.iter().map(|ix| {
-            let data_col = try!(self.materialize_column(planks, *ix));
-            Vector::index_join(&data_col, &indices)
+            let data_col = try!(self.materialize_column(job, planks, *ix));
+            Ok(TempVector::index_join(&data_col, &indices))
         }).collect()
     }
 }
@@ -126,25 +127,21 @@ pub struct Transaction {
     // TODO also need a way to nuke the planks but keep the vectors for zero-copy ALTER (?)
 }
 
-const MIN_USER_TABLE: u64 = 256;
-const PLANK_TABLE: u64 = 0;
 const MAX_TABLE_COLUMNS: u32 = u32::MAX / 4;
 
 impl Transaction {
-    fn materialize_table(&self, attach: &Attachment, table_id: u64) -> Result<Vec<Plank>> {
+    fn materialize_table(&self, job: &JobRef, attach: &Attachment, table_id: u64)
+                         -> Result<Vec<Plank>> {
         // Need to hold the read lock for the duration of this function to prevent external vectors from being deleted out from under us
         let mut cords = try!(attach.get_cords());
 
-        if table_id == PLANK_TABLE {
-            return Ok(cords);
-        }
-
         let mut ix = [0; 8];
         NativeEndian::write_u64(&mut ix, table_id);
-        let tbl_planks_vecs = try!(attach.point_query(&mut cords[..], 0, &ix, &[1]));
+        let tbl_planks_vecs = try!(attach.point_query(job, &mut cords[..], 0, &ix, &[1]));
         // TODO consider making the planks table three-column and having max_stamp be volatile for efficient merging
 
-        let mut planks : Vec<Plank> = try!(tbl_planks_vecs[0].get_entries().iter()
+        let plank_data = try!(tbl_planks_vecs[0].get_entries());
+        let mut planks : Vec<Plank> = try!(plank_data.iter()
             .map(|pb| Plank::parse_bytes(pb)).collect());
         planks.retain(|pl| self.start_stamp >= pl.min_stamp && self.start_stamp < pl.max_stamp);
         if let Some(unc) = self.uncommitted.get(&(attach.db_id, table_id)) {
@@ -155,20 +152,21 @@ impl Transaction {
     }
 
     // Trying to access a nonexistant table or column returns Error::Corruption, on the assumption that you followed a broken link
-    pub fn materialize_column(&self, db_id: u32, table_id: u64, column_index: u32)
-                              -> Result<Vector> {
+    pub fn materialize_column(&self, job: &JobRef, db_id: u32, table_id: u64, column_index: u32)
+                              -> Result<TempVector> {
         let list_g = self.mvcc.attached.read().unwrap();
         let attach_g = try!(list_g.get(db_id as usize).ok_or(Error::DatabaseDetached)).read().unwrap();
-        let mut planks = try!(self.materialize_table(attach_g.deref(), table_id));
-        attach_g.materialize_column(&mut planks[..], column_index)
+        let mut planks = try!(self.materialize_table(job, attach_g.deref(), table_id));
+        attach_g.materialize_column(job, &mut planks[..], column_index)
     }
 
-    pub fn mutate_table(&mut self, db_id: u32, table_id: u64, vids_to_delete: &Vector,
-                        row_count: u64, append: &Vec<Vector>) -> Result<u64> {
+    pub fn mutate_table(&mut self, job: &JobRef, db_id: u32, table_id: u64,
+                        vids_to_delete: TempVector, row_count: u64, append: Vec<TempVector>)
+                        -> Result<u64> {
         // TODO interface is unnecessarily restricted, not all tables have vids
         let list_g = self.mvcc.attached.read().unwrap();
         let attach_g = try!(list_g.get(db_id as usize).ok_or(Error::DatabaseDetached)).read().unwrap();
-        let mut planks = try!(self.materialize_table(attach_g.deref(), table_id));
+        let mut planks = try!(self.materialize_table(job, attach_g.deref(), table_id));
 
         if planks.len() == 0 {
             return Err(corruption("modifying nonexistant table"));
@@ -186,21 +184,22 @@ impl Transaction {
 
         let mut segments = Vec::new();
         segments.push(LazyVector::Loaded {
-            vector: try!(Vector::seq_u64_native(last_vid + 1, row_count))
+            vector: try!(TempVector::seq_u64_native(last_vid + 1, row_count).to_persistent())
         });
-        segments.push(LazyVector::Loaded { vector: vids_to_delete.clone() });
+        let tombstone_count = try!(vids_to_delete.len());
+        segments.push(LazyVector::Loaded { vector: try!(vids_to_delete.to_persistent()) });
         for aseg in append {
-            if aseg.len() as u64 != row_count {
+            if try!(aseg.len()) as u64 != row_count {
                 return Err(corruption("mismatched lengths in insert"));
             }
-            segments.push(LazyVector::Loaded { vector: aseg.clone() });
+            segments.push(LazyVector::Loaded { vector: try!(aseg.to_persistent()) });
         }
 
         let new_plank = Plank {
             min_stamp: 0, max_stamp: 0, // will be filled in on commit
             last_vid: last_vid + row_count,
             row_count: row_count,
-            tombstone_count: vids_to_delete.len(),
+            tombstone_count: tombstone_count,
             segments: segments,
         };
 
@@ -222,11 +221,11 @@ impl Transaction {
 #[derive(Clone)]
 enum LazyVector {
     Unloaded { filenum: u64 },
-    Loaded { vector: Vector },
+    Loaded { vector: PersistVector },
 }
 
 impl LazyVector {
-    fn load(&mut self, att: &Attachment) -> Result<Vector> {
+    fn load(&mut self, att: &Attachment) -> Result<PersistVector> {
         match *self {
             LazyVector::Loaded { ref vector } => Ok(vector.clone()),
             LazyVector::Unloaded { filenum } => {
@@ -235,6 +234,10 @@ impl LazyVector {
                 Ok(vec)
             }
         }
+    }
+
+    fn load_bind(&mut self, att: &Attachment, job: &JobRef) -> Result<TempVector> {
+        Ok(try!(self.load(att)).to_temporary(job))
     }
 
     // TODO: inline short vectors
