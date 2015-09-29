@@ -67,6 +67,7 @@ impl MVCC {
         Ok(new_id)
     }
 
+    #[allow(unused_variables)]
     pub fn detach_database(&self, db_id: u32) -> Result<()> {
         unimplemented!()
     }
@@ -92,27 +93,27 @@ impl Attachment {
         if planks[0].segments.len() < 2 || column_index as usize > planks[0].segments.len() - 2 {
             return Err(Error::Corruption { detail: "attempt to read out of range column".to_string() });
         }
-        let vid_merged = TempVector::concat(job, &try!(planks.iter_mut()
+        let vid_merged = TempVector::concat(job, try!(planks.iter_mut()
             .map(|p| p.segments[0].load_bind(self, job)).collect()));
-        let ts_merged = TempVector::concat(job, &try!(planks.iter_mut()
+        let ts_merged = TempVector::concat(job, try!(planks.iter_mut()
             .map(|p| p.segments[1].load_bind(self, job)).collect()));
-        let data_merged = TempVector::concat(job, &try!(planks.iter_mut()
+        let data_merged = TempVector::concat(job, try!(planks.iter_mut()
             .map(|p| p.segments[(column_index as usize) + 2].load_bind(self, job)).collect()));
         // TODO a multi-materialize would allow sharing the antijoin work
-        let ts_indices = TempVector::join_index(&vid_merged, &ts_merged);
-        Ok(TempVector::index_antijoin(&data_merged, &ts_indices))
+        let ts_indices = TempVector::join_index(vid_merged, ts_merged);
+        Ok(TempVector::index_antijoin(data_merged, ts_indices))
     }
 
     // This is separate so that it can have a more efficient implementation (Not fully materializing)
     fn point_query(&self, job: &JobRef, planks: &mut [Plank], lookup_column_index: u32,
-                   lookup_column_value: &[u8], fetch_column_indices: &[u32])
+                   lookup_column_value: Vec<u8>, fetch_column_indices: &[u32])
                    -> Result<Vec<TempVector>> {
         let lookup_col = try!(self.materialize_column(job, planks, lookup_column_index));
-        let indices = TempVector::point_index(&lookup_col, lookup_column_value);
+        let indices = TempVector::point_index(lookup_col, lookup_column_value);
 
         fetch_column_indices.iter().map(|ix| {
             let data_col = try!(self.materialize_column(job, planks, *ix));
-            Ok(TempVector::index_join(&data_col, &indices))
+            Ok(TempVector::index_join(data_col, indices.clone()))
         }).collect()
     }
 }
@@ -137,10 +138,10 @@ impl Transaction {
 
         let mut ix = [0; 8];
         NativeEndian::write_u64(&mut ix, table_id);
-        let tbl_planks_vecs = try!(attach.point_query(job, &mut cords[..], 0, &ix, &[1]));
+        let mut tbl_planks_vecs = try!(attach.point_query(job, &mut cords[..], 0, Vec::from(&ix as &[u8]), &[1]));
         // TODO consider making the planks table three-column and having max_stamp be volatile for efficient merging
 
-        let plank_data = try!(tbl_planks_vecs[0].get_entries());
+        let plank_data = try!(tbl_planks_vecs.remove(0).get_entries()); // TODO can slice patterns be used here?
         let mut planks : Vec<Plank> = try!(plank_data.iter()
             .map(|pb| Plank::parse_bytes(pb)).collect());
         planks.retain(|pl| self.start_stamp >= pl.min_stamp && self.start_stamp < pl.max_stamp);
@@ -184,12 +185,12 @@ impl Transaction {
 
         let mut segments = Vec::new();
         segments.push(LazyVector::Loaded {
-            vector: try!(TempVector::seq_u64_native(job, last_vid + 1, row_count).to_persistent())
+            vector: try!(TempVector::seq_u64(job, last_vid + 1, row_count).to_persistent())
         });
-        let tombstone_count = try!(vids_to_delete.len());
+        let tombstone_count = try!(vids_to_delete.clone().len());
         segments.push(LazyVector::Loaded { vector: try!(vids_to_delete.to_persistent()) });
         for aseg in append {
-            if try!(aseg.len()) as u64 != row_count {
+            if try!(aseg.clone().len()) as u64 != row_count {
                 return Err(corruption("mismatched lengths in insert"));
             }
             segments.push(LazyVector::Loaded { vector: try!(aseg.to_persistent()) });
@@ -208,6 +209,7 @@ impl Transaction {
         Ok(last_vid + 1)
     }
 
+    #[allow(unused_variables)]
     pub fn create_table(&mut self, db_id: u32, num_columns: u32) -> Result<u64> {
         unimplemented!()
     }
@@ -251,6 +253,7 @@ impl LazyVector {
 /// A section of a table; cannot usefully be interpreted without schema information
 #[derive(Clone)]
 struct Plank {
+    // TODO ughh we need to move these into the segments table to allow for merging segments with different ages
     min_stamp: u64,
     max_stamp: u64,
     last_vid: u64,

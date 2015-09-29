@@ -3,17 +3,20 @@
 extern crate byteorder;
 extern crate rmp;
 
+use std::io::Error as IoError;
+use std::sync::Arc;
+
 mod vector;
 mod durability;
 mod mvcc;
 
 // TODO provide a central log mechanism
 // TODO provide a mechanism for corruption errors to trigger read only
-#[derive(Debug)]
+#[derive(Debug,Clone)]
 pub enum Error {
     // TODO Corruption errors frequently have less information than they could.  Audit
     Corruption { detail: String },
-    IO { cause: ::std::io::Error },
+    IO { cause: Arc<IoError> }, // TODO convince rust people to make IoError Clone
     QuotaExceeded,
     Conflict,
     DatabaseDetached,
