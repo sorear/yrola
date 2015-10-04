@@ -1,4 +1,4 @@
-//! Module documentation goes here
+// Module documentation goes here
 
 use std::cell::RefCell;
 use std::collections::{HashSet,HashMap};
@@ -8,14 +8,17 @@ use std::rc::Rc;
 use std::sync::{Arc,Mutex};
 use std::iter::FromIterator;
 
-use byteorder::{LittleEndian,ByteOrder};
-
+use misc;
 use ::Result;
 
 // TODO add resource accounting, allocations/time (Jobs)
 // TODO vectors should be owned by jobs, with a fictitious duplicate for recycling and columns
 // TODO vector operations should be lazy to allow for parallelism
 // Minimum viable vectors, TODO blittable, fixed-stride, scattered, and inline vectors
+
+// TODO byte level representations: blob64, varblob, fixed(N), swab{2,4,8}, dictblob, constant,
+// range representation issue is also closely related to the NUMA/clustering angle, and may need to
+// "recurse"; a sharded column could be a join in each shard
 
 pub struct Engine {
     // A home for all global tuning parameters for the execution
@@ -97,17 +100,6 @@ fn new_temp(job: &JobRef, data: Arc<Vec<Vec<u8>>>) -> TempVector {
     new_temp_state(job, TempVectorState::Data(data))
 }
 
-fn u64vec(x: u64) -> Vec<u8> {
-    let mut buf = [0; 8];
-    LittleEndian::write_u64(&mut buf, x);
-    buf.to_vec()
-}
-
-fn vecu64(x: &Vec<u8>) -> Option<u64> {
-    if x.len() != 8 { return None; }
-    Some(LittleEndian::read_u64(&x[..]))
-}
-
 impl TempVector {
     #[allow(unused_variables)]
     fn force(self) -> Result<Arc<Vec<Vec<u8>>>> {
@@ -133,19 +125,20 @@ impl TempVector {
     pub fn job_ref(&self) -> &JobRef { &self.body.job }
     pub fn job(&self) -> &Job { self.body.job.deref() }
 
-    #[allow(unused_variables)]
     pub fn lazy<T>(job: &JobRef, func: T) -> TempVector
-                   where T : 'static + FnMut(&JobRef) -> Result<TempVector> {
-        new_temp_state(job, TempVectorState::Thunk(Box::new(func)))
+                   where T : 'static + FnOnce(&JobRef) -> Result<TempVector> {
+        let mut mfunc = Some(func);
+        let f2 : Box<FnMut(&JobRef) -> Result<TempVector>> =
+            Box::new(move |jr| mfunc.take().unwrap()(jr));
+        new_temp_state(job, TempVectorState::Thunk(f2))
     }
 
     pub fn concat(job: &JobRef, vecs: Vec<TempVector>) -> TempVector {
         assert!(vecs.iter().all(|v| ptr_eq::<Job>(job.deref(), v.job())),
             "trying to concatenate temporaries spanning jobs");
-        let mut mvecs = Some(vecs); // TODO FnOnce
         Self::lazy(job, move |job| {
             let datas : Vec<Arc<Vec<Vec<u8>>>> =
-                try!(mvecs.take().unwrap().into_iter().map(|v| v.force()).collect());
+                try!(vecs.into_iter().map(|v| v.force()).collect());
             Ok(new_temp(job, Arc::new(datas.iter().flat_map(|v| v.iter().cloned()).collect())))
         })
     }
@@ -163,15 +156,13 @@ impl TempVector {
     pub fn join_index(table: TempVector, keys: TempVector) -> TempVector {
         assert!(ptr_eq::<Job>(table.job(), keys.job()));
         let job = table.job_ref().clone();
-        let mut mtable = Some(table); // TODO FnOnce
-        let mut mkeys = Some(keys);
         Self::lazy(&job, move |job| {
-            let tdata = try!(mtable.take().unwrap().force());
-            let kdata = try!(mkeys.take().unwrap().force());
+            let tdata = try!(table.force());
+            let kdata = try!(keys.force());
             let lookup = HashMap::<Vec<u8>,usize>::from_iter(tdata.iter().cloned().enumerate()
                 .map(|(a,b)| (b,a)));
             Ok(new_temp(job, Arc::new(kdata.iter()
-                .filter_map(|kk| lookup.get(kk).map(|v| u64vec(*v as u64))).collect())))
+                .filter_map(|kk| lookup.get(kk).map(|v| misc::u64_to_bytes(*v as u64))).collect())))
         })
     }
 
@@ -180,14 +171,12 @@ impl TempVector {
     pub fn index_antijoin(table: TempVector, remove: TempVector) -> TempVector {
         assert!(ptr_eq::<Job>(table.job(), remove.job()));
         let job = table.job_ref().clone();
-        let mut mtable = Some(table); // TODO FnOnce
-        let mut mrem = Some(remove);
         Self::lazy(&job, move |job| {
-            let tdata = try!(mtable.take().unwrap().force());
-            let rdata = try!(mrem.take().unwrap().force());
+            let tdata = try!(table.force());
+            let rdata = try!(remove.force());
             let lookup = HashSet::<Vec<u8>>::from_iter(rdata.iter().cloned());
             Ok(new_temp(job, Arc::new(tdata.iter().enumerate()
-                .filter_map(|(ix,v)| if lookup.contains(&u64vec(ix as u64)) {
+                .filter_map(|(ix,v)| if lookup.contains(&misc::u64_to_bytes(ix as u64)) {
                     None
                 } else {
                     Some(v)
@@ -199,11 +188,10 @@ impl TempVector {
     #[allow(unused_variables)]
     pub fn point_index(table: TempVector, key: Vec<u8>) -> TempVector {
         let job = table.job_ref().clone();
-        let mut mtable = Some(table); // TODO FnOnce
         Self::lazy(&job, move |job| {
-            let tdata = try!(mtable.take().unwrap().force());
+            let tdata = try!(table.force());
             Ok(new_temp(job, Arc::new(tdata.iter().enumerate()
-                .filter_map(|(ix,v)| if *v == key { Some(u64vec(ix as u64)) } else { None })
+                .filter_map(|(ix,v)| if *v == key { Some(misc::u64_to_bytes(ix as u64)) } else { None })
                 .collect())))
         })
     }
@@ -212,13 +200,11 @@ impl TempVector {
     pub fn index_join(table: TempVector, query: TempVector) -> TempVector {
         assert!(ptr_eq::<Job>(table.job(), query.job()));
         let job = table.job_ref().clone();
-        let mut mtable = Some(table); // TODO FnOnce
-        let mut mquery = Some(query);
         Self::lazy(&job, move |job| {
-            let tdata = try!(mtable.take().unwrap().force());
-            let qdata = try!(mquery.take().unwrap().force());
+            let tdata = try!(table.force());
+            let qdata = try!(query.force());
             Ok(new_temp(job, Arc::new(qdata.iter()
-                .filter_map(|ixv| vecu64(ixv).and_then(|ix| tdata.get(ix as usize).cloned()))
+                .filter_map(|ixv| misc::bytes_to_u64(ixv).and_then(|ix| tdata.get(ix as usize).cloned()))
                 .collect())))
         })
     }
@@ -226,7 +212,7 @@ impl TempVector {
     #[allow(unused_variables)]
     pub fn seq_u64(job: &JobRef, start: u64, count: u64) -> TempVector {
         Self::lazy(&job, move |job| {
-            Ok(new_temp(job, Arc::new((0 .. count).map(|ix| u64vec(ix + start)).collect())))
+            Ok(new_temp(job, Arc::new((0 .. count).map(|ix| misc::u64_to_bytes(ix + start)).collect())))
         })
     }
 
@@ -243,7 +229,7 @@ impl PersistVector {
 mod tests {
     use ::{Error};
     use super::*;
-    use super::u64vec;
+    use ::misc;
 
     fn test_job() -> JobRef {
         JobRef::new(Job::new(&EngineRef::new(Engine::new()), From::from("Test job")))
@@ -304,13 +290,13 @@ mod tests {
         let tv = TempVector::new_from_entries(&test_job(), vec![vec![1,2],vec![3]]);
         let tv2 = TempVector::new_from_entries(tv.job_ref(), vec![vec![3],vec![1,2],vec![4]]);
         let tv3 = TempVector::join_index(tv, tv2);
-        assert_eq!(tv3.get_entries().unwrap(), vec![u64vec(1),u64vec(0)]);
+        assert_eq!(tv3.get_entries().unwrap(), vec![misc::u64_to_bytes(1),misc::u64_to_bytes(0)]);
     }
 
     #[test]
     fn test_index_antijoin() {
         let tv = TempVector::new_from_entries(&test_job(), vec![vec![3],vec![4],vec![5]]);
-        let tv2 = TempVector::new_from_entries(tv.job_ref(), vec![u64vec(1)]);
+        let tv2 = TempVector::new_from_entries(tv.job_ref(), vec![misc::u64_to_bytes(1)]);
         let tv3 = TempVector::index_antijoin(tv, tv2);
         assert_eq!(tv3.get_entries().unwrap(), vec![vec![3],vec![5]]);
     }
@@ -319,13 +305,13 @@ mod tests {
     fn test_point_index() {
         let tv = TempVector::new_from_entries(&test_job(), vec![vec![3],vec![4],vec![3]]);
         let tv2 = TempVector::point_index(tv, vec![3]);
-        assert_eq!(tv2.get_entries().unwrap(), vec![u64vec(0),u64vec(2)]);
+        assert_eq!(tv2.get_entries().unwrap(), vec![misc::u64_to_bytes(0),misc::u64_to_bytes(2)]);
     }
 
     #[test]
     fn test_index_join() {
         let tv = TempVector::new_from_entries(&test_job(), vec![vec![3],vec![4],vec![5]]);
-        let tv2 = TempVector::new_from_entries(tv.job_ref(), vec![u64vec(2),u64vec(0)]);
+        let tv2 = TempVector::new_from_entries(tv.job_ref(), vec![misc::u64_to_bytes(2),misc::u64_to_bytes(0)]);
         let tv3 = TempVector::index_join(tv, tv2);
         assert_eq!(tv3.get_entries().unwrap(), vec![vec![5],vec![3]]);
     }
@@ -333,6 +319,6 @@ mod tests {
     #[test]
     fn test_seq_u64() {
         let tv = TempVector::seq_u64(&test_job(), 3, 2);
-        assert_eq!(tv.get_entries().unwrap(), vec![u64vec(3),u64vec(4)]);
+        assert_eq!(tv.get_entries().unwrap(), vec![misc::u64_to_bytes(3),misc::u64_to_bytes(4)]);
     }
 }
