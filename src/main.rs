@@ -29,8 +29,7 @@ fn corruption<T>(detail: T) -> Error where String : From<T> {
 }
 
 impl From<rmp::decode::ValueReadError> for Error {
-    #[allow(unused_variables)]
-    fn from(e: rmp::decode::ValueReadError) -> Error {
+    fn from(_e: rmp::decode::ValueReadError) -> Error {
         unimplemented!()
     }
 }

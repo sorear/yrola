@@ -67,8 +67,7 @@ impl MVCC {
         Ok(new_id)
     }
 
-    #[allow(unused_variables)]
-    pub fn detach_database(&self, db_id: u32) -> Result<()> {
+    pub fn detach_database(&self, _db_id: u32) -> Result<()> {
         unimplemented!()
     }
 }
@@ -224,8 +223,7 @@ impl Transaction {
         Ok(last_vid + 1)
     }
 
-    #[allow(unused_variables)]
-    pub fn create_table(&mut self, db_id: u32, num_columns: u32) -> Result<u64> {
+    pub fn create_table(&mut self, _db_id: u32, _num_columns: u32) -> Result<u64> {
         unimplemented!()
     }
 

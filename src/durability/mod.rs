@@ -40,6 +40,17 @@ pub trait DurProvider {
     }
 }
 
+//Yuck
+impl DurProvider {
+    pub fn with_read_section<'s,F,R>(&'s self, mut func: F) -> Result<R> where F : FnMut(&mut DurReadSection) -> Result<R>, F : 's, R : 's {
+        let mut rv = None;
+        try!(self.read_section(Box::new(|section: &mut DurReadSection| {
+            func(section).map(|success| rv = Some(success))
+        })));
+        Ok(rv.unwrap())
+    }
+}
+
 struct NoneDurabilityData {
     files: HashMap<u64, PersistVector>,
     items: HashMap<u64, (u8, Vec<u8>)>,
