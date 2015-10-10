@@ -26,6 +26,9 @@ pub trait DurPrepareSection : DurReadSection {
     fn add_journal_item(&mut self, jtype: u8, data: &[u8]) -> Result<u64>;
 
     fn del_journal_item(&mut self, jinum: u64) -> Result<()>;
+
+    // TODO Rust does not subtype here
+    fn is_read(&mut self) -> &mut DurReadSection;
 }
 
 // TODO: Refactor synchronization here.  We don't want to entirely duplicate the locking responsibility.
@@ -41,10 +44,19 @@ pub trait DurProvider {
 }
 
 //Yuck
+// TODO: Switch to RAII
 impl DurProvider {
     pub fn with_read_section<'s,F,R>(&'s self, mut func: F) -> Result<R> where F : FnMut(&mut DurReadSection) -> Result<R>, F : 's, R : 's {
         let mut rv = None;
         try!(self.read_section(Box::new(|section: &mut DurReadSection| {
+            func(section).map(|success| rv = Some(success))
+        })));
+        Ok(rv.unwrap())
+    }
+
+    pub fn with_prepare_section<'s,F,R>(&'s self, mut func: F) -> Result<R> where F : FnMut(&mut DurPrepareSection) -> Result<R>, F : 's, R : 's {
+        let mut rv = None;
+        try!(self.prepare_section(Box::new(|section| {
             func(section).map(|success| rv = Some(success))
         })));
         Ok(rv.unwrap())
@@ -78,6 +90,8 @@ impl DurPrepareSection for NoneDurabilityData {
         self.files.insert(filenum, data.clone());
         Ok(filenum)
     }
+
+    fn is_read(&mut self) -> &mut DurReadSection { self }
 
     fn del_vector(&mut self, filenum: u64) -> Result<()> {
         self.files.remove(&filenum).map(|_| ()).ok_or_else(|| ::corruption("no such vector"))

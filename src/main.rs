@@ -28,11 +28,19 @@ fn corruption<T>(detail: T) -> Error where String : From<T> {
     Error::Corruption { detail: From::from(detail) }
 }
 
-impl From<rmp::decode::ValueReadError> for Error {
-    fn from(_e: rmp::decode::ValueReadError) -> Error {
-        unimplemented!()
+macro_rules! corruptiony {
+    ( $typ:ty ) => {
+        impl From<$typ> for Error {
+            fn from(e: $typ) -> Error {
+                corruption(format!("{:?}", e))
+            }
+        }
     }
 }
+
+corruptiony! { rmp::encode::ValueWriteError }
+corruptiony! { rmp::decode::ValueReadError }
+corruptiony! { IoError }
 
 pub type Result<T> = ::std::result::Result<T,Error>;
 
