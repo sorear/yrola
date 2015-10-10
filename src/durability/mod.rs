@@ -61,8 +61,10 @@ impl DurReadSection for ArcMutexGuard<NoneDurabilityData> {
     }
 
     fn get_journal_items(&mut self, jtype: u8) -> Result<Vec<(u64, Vec<u8>)>> {
-        Ok(self.items.iter().filter_map(|(fno,tydata)|
-            if tydata.0 == jtype { Some((*fno,tydata.1.clone())) } else { None }).collect())
+        let mut list : Vec<(u64, Vec<u8>)> = self.items.iter().filter_map(|(fno,tydata)|
+            if tydata.0 == jtype { Some((*fno,tydata.1.clone())) } else { None }).collect();
+        list.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(list)
     }
 }
 

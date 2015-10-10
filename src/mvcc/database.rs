@@ -2,31 +2,36 @@ use std::sync::{Arc};
 use std::io::{Read,Write,Cursor};
 
 use durability::{DurProvider,DurReadSection,DurPrepareSection};
-use vector::{TempVector,Job};
+use vector::{PersistVector,TempVector,Job};
 use {Result,Error,corruption};
 use misc;
 use rmp;
 
 struct AttachedDatabaseBody {
-    provider: Arc<DurProvider>,
+    provider: Arc<DurProvider>, // TODO: this duplicates an Arc in DurProvider
 }
 pub struct AttachedDatabase(Arc<AttachedDatabaseBody>);
 
+// TODO : Consider drawing a type distinction between VectorSource and Plank which is used for export, import, or consumption
 enum VectorSource {
     NA,
     Unit(Vec<u8>),
-    // External(u64),
+    External(u64),
+    Loaded(PersistVector),
 }
 
 impl VectorSource {
-    fn get_vector(&self, job: &Job, _section: &mut DurReadSection) -> TempVector {
+    fn get_vector(&self, job: &Job, section: &mut DurReadSection) -> TempVector {
         match *self {
             VectorSource::NA => TempVector::new_from_entries(job, vec![]),
             VectorSource::Unit(ref v) => TempVector::new_from_entries(job, vec![v.clone()]),
-            // VectorSource::External(id) => {
-            //     let rse = section.get_vector(id);
-            //     TempVector::lazy(job, move |jr| Ok(try!(rse).to_temporary(jr)))
-            // }
+            VectorSource::External(id) => {
+                let rse = section.get_vector(id);
+                TempVector::lazy(job, move |jr| Ok(try!(rse).to_temporary(jr)))
+            },
+            VectorSource::Loaded(ref pv) => {
+                pv.to_temporary(job)
+            }
         }
     }
 
@@ -40,11 +45,12 @@ impl VectorSource {
                 try!(rd.read(&mut copy[..]));
                 Ok(VectorSource::Unit(copy))
             },
+            3 => Ok(VectorSource::External(try!(rmp::decode::read_u64_fit(rd)))),
             _ => Err(corruption("Unknown tag")),
         }
     }
 
-    fn write<W>(&self, wr: &mut W) -> Result<()> where W: Write {
+    fn write<W>(&self, wr: &mut W, section: &mut DurPrepareSection) -> Result<()> where W: Write {
         match *self {
             VectorSource::NA => {
                 try!(rmp::encode::write_uint(wr, 1));
@@ -53,6 +59,14 @@ impl VectorSource {
                 try!(rmp::encode::write_uint(wr, 2));
                 try!(rmp::encode::write_bin_len(wr, data.len() as u32));
                 try!(wr.write(&data[..]));
+            },
+            VectorSource::External(id) => {
+                try!(rmp::encode::write_uint(wr, 3));
+                try!(rmp::encode::write_uint(wr, id));
+            },
+            VectorSource::Loaded(ref pvec) => {
+                try!(rmp::encode::write_uint(wr, 3));
+                try!(rmp::encode::write_uint(wr, try!(section.save_vector(&pvec))));
             },
         }
         Ok(())
@@ -89,15 +103,15 @@ impl DataPlank {
         })
     }
 
-    fn write<W>(&self, wr: &mut W) -> Result<()> where W: Write {
+    fn write<W>(&self, wr: &mut W, section: &mut DurPrepareSection) -> Result<()> where W: Write {
         try!(rmp::encode::write_uint(wr, self.insert_count));
         try!(rmp::encode::write_uint(wr, self.tombstone_count));
         try!(rmp::encode::write_uint(wr, self.last_vid));
-        try!(self.vid_vector.write(wr));
-        try!(self.tombstone_vector.write(wr));
+        try!(self.vid_vector.write(wr, section));
+        try!(self.tombstone_vector.write(wr, section));
         try!(rmp::encode::write_uint(wr, self.column_vectors.len() as u64));
         for cv in &self.column_vectors {
-            try!(cv.write(wr));
+            try!(cv.write(wr, section));
         }
         Ok(())
     }
@@ -139,9 +153,9 @@ impl Plank {
         Ok(plank)
     }
 
-    fn to_bytes(self: &Plank) -> Vec<u8> {
+    fn to_bytes(self: &Plank, section: &mut DurPrepareSection) -> Vec<u8> {
         let mut wr = Cursor::new(Vec::new());
-        self.write(&mut wr).unwrap(); // Writes into one of these cannot fail
+        self.write(&mut wr, section).unwrap(); // Writes into one of these cannot fail
         wr.into_inner()
     }
 
@@ -154,7 +168,7 @@ impl Plank {
         }
     }
 
-    fn write<W>(&self, wr: &mut W) -> Result<()> where W: Write {
+    fn write<W>(&self, wr: &mut W, section: &mut DurPrepareSection) -> Result<()> where W: Write {
         match *self {
             Plank::LowSchema(ref ls) => {
                 try!(rmp::encode::write_uint(wr, 1));
@@ -162,7 +176,7 @@ impl Plank {
             },
             Plank::Data(ref pd) => {
                 try!(rmp::encode::write_uint(wr, 2));
-                try!(pd.write(wr));
+                try!(pd.write(wr, section));
             }
         };
         Ok(())
@@ -180,13 +194,8 @@ impl AttachedDatabase {
 
     pub fn materialize_table(&self, job: &Job, table_id: u64, indices: Vec<u32>) -> Result<Vec<TempVector>> {
         let mut section = self.0.provider.read_section();
-        let mut sectionp = &mut *section;
-        let cords = try!(self.get_cords(sectionp));
-        let planks_raw = self.point_query(job, sectionp, &cords[..], 0, &misc::u64_to_bytes(table_id)[..], &[1]).pop().unwrap();
-        let planks_bytes = try!(planks_raw.get_entries());
-        let planks : Vec<Plank> =
-            try!(planks_bytes.into_iter().map(|data| Plank::from_bytes(&data[..])).collect());
-        Ok(self.materialize_columns(job, sectionp, &planks[..], &indices[..]))
+        let planks = try!(self.planks_for_table(job, &mut *section, table_id));
+        Ok(self.materialize_columns(job, &mut *section, &planks[..], &indices[..]))
     }
 
     pub fn create_table(&self, job: &Job, column_count: u32) -> Result<u64> {
@@ -200,6 +209,42 @@ impl AttachedDatabase {
         Ok(new_table_id)
     }
 
+    pub fn insert_rows(&self, job: &Job, table_id: u64, row_count: u64, data: Vec<TempVector>) -> Result<()> {
+        let mut section = self.0.provider.prepare_section();
+        let planks = try!(self.planks_for_table(job, section.is_read(), table_id));
+        let schema = try!(self.get_table_schema(&planks[..]));
+        let last_vid = try!(self.get_last_vid(job, section.is_read(), &planks[..]));
+        if last_vid.checked_add(row_count).is_none() {
+            unimplemented!()
+        }
+        if data.len() != (schema.column_count as usize) {
+            unimplemented!()
+        }
+        let mut persist_copies = Vec::new();
+        for temp_vec in data {
+            let persist_vec = try!(temp_vec.to_persistent());
+            if persist_vec.len() != row_count {
+                unimplemented!();
+            }
+            persist_copies.push(VectorSource::Loaded(persist_vec));
+        }
+        let new_plank = Plank::Data(DataPlank {
+            insert_count: row_count, last_vid: last_vid + row_count, tombstone_count: 0,
+            vid_vector: VectorSource::Loaded(try!(TempVector::seq_u64(job, last_vid + 1, row_count).to_persistent())),
+            tombstone_vector: VectorSource::NA,
+            column_vectors: persist_copies,
+        });
+        try!(self.append_plank(job, &mut *section, table_id, &new_plank));
+        Ok(())
+    }
+
+    fn planks_for_table(&self, job: &Job, section: &mut DurReadSection, table_id: u64) -> Result<Vec<Plank>> {
+        let cords = try!(self.get_cords(section));
+        let planks_raw = self.point_query(job, section, &cords[..], 0, misc::u64_to_bytes(table_id).as_ref(), &[1]).pop().unwrap();
+        let planks_bytes = try!(planks_raw.get_entries());
+        planks_bytes.into_iter().map(|data| Plank::from_bytes(&data[..])).collect()
+    }
+
     fn append_plank(&self, job: &Job, section: &mut DurPrepareSection, table_id: u64, new_plank: &Plank) -> Result<u64> {
         let cords = try!(self.get_cords(section.is_read()));
         let last_id = try!(self.get_last_vid(job, section.is_read(), &cords[..]));
@@ -210,7 +255,7 @@ impl AttachedDatabase {
             tombstone_vector: VectorSource::NA,
             column_vectors: vec![
                 VectorSource::Unit(misc::u64_to_bytes(table_id)),
-                VectorSource::Unit(Plank::to_bytes(new_plank)),
+                VectorSource::Unit(Plank::to_bytes(new_plank, section)),
             ]
         });
         try!(self.append_cord(job, section, &new_cord));
@@ -218,7 +263,8 @@ impl AttachedDatabase {
     }
 
     fn append_cord(&self, _job: &Job, section: &mut DurPrepareSection, new_cord: &Plank) -> Result<u64> {
-        section.add_journal_item(0, Plank::to_bytes(new_cord).as_ref())
+        let cord_bytes = Plank::to_bytes(new_cord, section);
+        section.add_journal_item(0, cord_bytes.as_ref())
     }
 
     fn get_cords(&self, section: &mut DurReadSection) -> Result<Vec<Plank>> {
@@ -235,6 +281,17 @@ impl AttachedDatabase {
                 None
             }
         }).max().unwrap_or(0))
+    }
+
+    fn get_table_schema<'a,'b>(&'a self, planks: &'b [Plank]) -> Result<&'b LowSchemaPlank> {
+        let mut found = None;
+        for plank in planks {
+            if let Plank::LowSchema(ref low_schema) = *plank {
+                if found.is_some() { unimplemented!(); }
+                found = Some(low_schema);
+            }
+        }
+        found.ok_or_else(|| unimplemented!())
     }
 
     fn materialize_columns(&self, job: &Job, section: &mut DurReadSection, planks: &[Plank], indices: &[u32]) -> Vec<TempVector> {
@@ -275,7 +332,7 @@ impl AttachedDatabase {
 #[cfg(test)]
 mod test {
     use durability::NoneDurProvider;
-    use vector::{Job,Engine};
+    use vector::{Job,Engine,TempVector};
     use std::sync::Arc;
     use super::AttachedDatabase;
 
@@ -292,11 +349,27 @@ mod test {
     }
 
     #[test]
-    fn create_table() {
+    fn create_table_basic() {
         let db = new_db();
         let job = new_job();
         let tbl1 = db.create_table(&job, 3).unwrap();
         let tbl2 = db.create_table(&job, 3).unwrap();
         assert!(tbl1 != tbl2);
+    }
+
+    #[test]
+    fn insert_rows_1() {
+        let db = new_db();
+        let job = new_job();
+        let tbl1 = db.create_table(&job, 1).unwrap();
+        assert_eq!(db.materialize_table(&job, tbl1, vec![0]).unwrap()[0].clone().len().unwrap(), 0);
+        db.insert_rows(&job, tbl1, 3,
+            vec![TempVector::new_from_entries(&job, vec![vec![1], vec![3], vec![2]])]).unwrap();
+        assert_eq!(db.materialize_table(&job, tbl1, vec![0]).unwrap()[0].clone().get_entries().unwrap(),
+            vec![vec![1], vec![3], vec![2]]);
+        db.insert_rows(&job, tbl1, 1,
+            vec![TempVector::new_from_entries(&job, vec![vec![4]])]).unwrap();
+        assert_eq!(db.materialize_table(&job, tbl1, vec![0]).unwrap()[0].clone().get_entries().unwrap(),
+            vec![vec![1], vec![3], vec![2], vec![4]]);
     }
 }

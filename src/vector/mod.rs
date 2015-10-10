@@ -221,6 +221,10 @@ impl PersistVector {
     pub fn to_temporary(&self, job: &Job) -> TempVector {
         new_temp(job, self.data.clone())
     }
+
+    pub fn len(&self) -> u64 {
+        self.data.len() as u64
+    }
 }
 
 #[cfg(test)]
