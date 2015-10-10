@@ -25,7 +25,8 @@ pub enum Error {
 
 // TODO this will likely have to go when errors are richer
 fn corruption<T>(detail: T) -> Error where String : From<T> {
-    Error::Corruption { detail: From::from(detail) }
+    unimplemented!()
+    // Error::Corruption { detail: From::from(detail) }
 }
 
 macro_rules! corruptiony {

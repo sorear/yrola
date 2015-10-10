@@ -1,7 +1,9 @@
 // The durability mechanism for Yrola
 use vector::PersistVector;
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex,Arc};
+use misc::ArcMutexGuard;
+use misc;
 use ::{Result,Error};
 
 pub mod file;
@@ -33,33 +35,13 @@ pub trait DurPrepareSection : DurReadSection {
 
 // TODO: Refactor synchronization here.  We don't want to entirely duplicate the locking responsibility.
 pub trait DurProvider {
-    fn prepare_section<'s>(&'s self, fnc: Box<FnMut(&mut DurPrepareSection) -> Result<()> + 's>) -> Result<()>;
-    fn read_section<'s>(&'s self, fnc: Box<FnMut(&mut DurReadSection) -> Result<()> + 's>) -> Result<()>;
+    fn prepare_section(&self) -> Box<DurPrepareSection>;
+    fn read_section(&self) -> Box<DurReadSection>;
     fn low_commit(&self) -> Result<()> {
         Ok(())
     }
     fn detach(&self) -> Result<()> {
         Ok(())
-    }
-}
-
-//Yuck
-// TODO: Switch to RAII
-impl DurProvider {
-    pub fn with_read_section<'s,F,R>(&'s self, mut func: F) -> Result<R> where F : FnMut(&mut DurReadSection) -> Result<R>, F : 's, R : 's {
-        let mut rv = None;
-        try!(self.read_section(Box::new(|section: &mut DurReadSection| {
-            func(section).map(|success| rv = Some(success))
-        })));
-        Ok(rv.unwrap())
-    }
-
-    pub fn with_prepare_section<'s,F,R>(&'s self, mut func: F) -> Result<R> where F : FnMut(&mut DurPrepareSection) -> Result<R>, F : 's, R : 's {
-        let mut rv = None;
-        try!(self.prepare_section(Box::new(|section| {
-            func(section).map(|success| rv = Some(success))
-        })));
-        Ok(rv.unwrap())
     }
 }
 
@@ -69,9 +51,10 @@ struct NoneDurabilityData {
     next_file: u64,
     next_item: u64,
 }
-pub struct NoneDurProvider(Mutex<NoneDurabilityData>);
+#[derive(Clone)]
+pub struct NoneDurProvider(Arc<Mutex<NoneDurabilityData>>);
 
-impl DurReadSection for NoneDurabilityData {
+impl DurReadSection for ArcMutexGuard<NoneDurabilityData> {
     fn get_vector(&mut self, filenum: u64) -> Result<PersistVector> {
         self.files.get(&filenum).cloned()
             .ok_or(Error::Corruption { detail: format!("Vector {} not found", filenum) })
@@ -83,7 +66,7 @@ impl DurReadSection for NoneDurabilityData {
     }
 }
 
-impl DurPrepareSection for NoneDurabilityData {
+impl DurPrepareSection for ArcMutexGuard<NoneDurabilityData> {
     fn save_vector(&mut self, data: &PersistVector) -> Result<u64> {
         self.next_file += 1;
         let filenum = self.next_file;
@@ -112,22 +95,20 @@ impl DurPrepareSection for NoneDurabilityData {
 
 impl NoneDurProvider {
     pub fn new() -> Self {
-        NoneDurProvider(Mutex::new(NoneDurabilityData {
+        NoneDurProvider(Arc::new(Mutex::new(NoneDurabilityData {
             files: HashMap::new(),
             items: HashMap::new(),
             next_file: 0,
             next_item: 0,
-        }))
+        })))
     }
 }
 
 impl DurProvider for NoneDurProvider {
-    fn prepare_section<'s>(&'s self, mut f: Box<FnMut(&mut DurPrepareSection) -> Result<()> + 's>) -> Result<()> {
-        let mut lock = self.0.lock().unwrap();
-        f(&mut *lock)
+    fn prepare_section(&self) -> Box<DurPrepareSection> {
+        Box::new(misc::lock_arc_mutex(&self.0).unwrap())
     }
-    fn read_section<'s>(&self, mut f: Box<FnMut(&mut DurReadSection) -> Result<()> + 's>) -> Result<()> {
-        let mut lock = self.0.lock().unwrap();
-        f(&mut *lock)
+    fn read_section(&self) -> Box<DurReadSection> {
+        Box::new(misc::lock_arc_mutex(&self.0).unwrap())
     }
 }

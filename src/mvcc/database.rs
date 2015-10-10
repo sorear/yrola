@@ -179,28 +179,25 @@ impl AttachedDatabase {
     }
 
     pub fn materialize_table(&self, job: &Job, table_id: u64, indices: Vec<u32>) -> Result<Vec<TempVector>> {
-        let jobr = job.clone();
-        self.0.provider.with_read_section(|section: &mut DurReadSection| {
-            let cords = try!(self.get_cords(section));
-            let planks_raw = self.point_query(&jobr, section, &cords[..], 0, &misc::u64_to_bytes(table_id)[..], &[1]).pop().unwrap();
-            let planks_bytes = try!(planks_raw.get_entries());
-            let planks : Vec<Plank> =
-                try!(planks_bytes.into_iter().map(|data| Plank::from_bytes(&data[..])).collect());
-            Ok(self.materialize_columns(&jobr, section, &planks[..], &indices[..]))
-        })
+        let mut section = self.0.provider.read_section();
+        let mut sectionp = &mut *section;
+        let cords = try!(self.get_cords(sectionp));
+        let planks_raw = self.point_query(job, sectionp, &cords[..], 0, &misc::u64_to_bytes(table_id)[..], &[1]).pop().unwrap();
+        let planks_bytes = try!(planks_raw.get_entries());
+        let planks : Vec<Plank> =
+            try!(planks_bytes.into_iter().map(|data| Plank::from_bytes(&data[..])).collect());
+        Ok(self.materialize_columns(job, sectionp, &planks[..], &indices[..]))
     }
 
     pub fn create_table(&self, job: &Job, column_count: u32) -> Result<u64> {
-        let jobr = job.clone();
-        self.0.provider.with_prepare_section(|section| {
-            let cords = try!(self.get_cords(section.is_read()));
-            let new_table_id = try!(try!(self.get_last_vid(&jobr, section.is_read(), &cords[..]))
-                .checked_add(1).ok_or_else::<Error,_>(|| unimplemented!()));
-            try!(self.append_plank(&jobr, section, new_table_id, &Plank::LowSchema(LowSchemaPlank {
-                column_count: column_count,
-            })));
-            Ok(new_table_id)
-        })
+        let mut section = self.0.provider.prepare_section();
+        let cords = try!(self.get_cords(section.is_read()));
+        let new_table_id = try!(try!(self.get_last_vid(job, section.is_read(), &cords[..]))
+            .checked_add(1).ok_or_else::<Error,_>(|| unimplemented!()));
+        try!(self.append_plank(job, &mut *section, new_table_id, &Plank::LowSchema(LowSchemaPlank {
+            column_count: column_count,
+        })));
+        Ok(new_table_id)
     }
 
     fn append_plank(&self, job: &Job, section: &mut DurPrepareSection, table_id: u64, new_plank: &Plank) -> Result<u64> {
