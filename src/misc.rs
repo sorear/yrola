@@ -1,3 +1,5 @@
+#![macro_use]
+
 use std::sync::{Arc,Mutex,MutexGuard,LockResult,PoisonError};
 use std::ops::{Deref,DerefMut};
 use std::mem;
@@ -41,5 +43,14 @@ pub fn lock_arc_mutex<T: 'static + ?Sized>(mutex: &Arc<Mutex<T>>) -> LockResult<
             mutex: mutex.clone(),
             guard: unsafe { mem::transmute(pguard.into_inner()) },
         })),
+    }
+}
+
+pub fn ptr_eq<T>(a: *const T, b: *const T) -> bool { a == b }
+macro_rules! eq_rcwrapper {
+    ($ty:ty) => {
+        impl PartialEq for $ty {
+            fn eq(&self, other: &$ty) -> bool { ::misc::ptr_eq(&*self.0, &*other.0) }
+        }
     }
 }

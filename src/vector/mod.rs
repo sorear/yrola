@@ -58,13 +58,7 @@ impl Job {
     pub fn engine(&self) -> &Engine { &self.0.engine }
 }
 
-impl PartialEq for Job {
-    fn eq(&self, other: &Job) -> bool {
-        let p1 : *const JobBody = &*self.0;
-        let p2 : *const JobBody = &*other.0;
-        p1 == p2
-    }
-}
+eq_rcwrapper!(Job);
 
 #[derive(Debug)]
 struct JobStatistics {

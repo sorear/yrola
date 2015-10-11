@@ -6,10 +6,10 @@ extern crate rmp;
 use std::io::Error as IoError;
 use std::sync::Arc;
 
+mod misc;
 mod vector;
 mod durability;
 mod mvcc;
-mod misc;
 
 // TODO provide a central log mechanism
 // TODO provide a mechanism for corruption errors to trigger read only
