@@ -271,13 +271,13 @@ impl AttachedDatabase {
             if section.is_read().next_journal_id() != trans.next_cord_id {
                 unimplemented!();
             }
-            for vec in trans.new_cords {
-                try!(section.add_journal_item(0, vec.as_ref()));
-            }
-            for (_, cookie) in trans.new_files {
-                try!(section.save_vector(cookie));
-            }
-            // unimplemented!() TODO atomic commit
+
+            try!(section.prepare(
+                trans.new_cords.into_iter().map(|data| (0, data)).collect(),
+                vec![],
+                trans.new_files.into_iter().map(|(_, cookie)| cookie).collect(),
+                vec![],
+            ));
         }
 
         Ok(())
@@ -383,6 +383,7 @@ mod test {
     use durability::NoneDurProvider;
     use vector::{Job,Engine,TempVector};
     use std::sync::Arc;
+    use std::mem;
     use super::{AttachedDatabase,TransactionData};
 
     fn new_db() -> AttachedDatabase {
@@ -429,36 +430,61 @@ mod test {
         let db = new_db();
         let job = new_job();
         let tbl1;
-        {
-            let mut trans1 = TransactionData::new();
-            tbl1 = db.create_table(&mut trans1, &job, 1).unwrap();
-            db.insert_rows(&mut trans1, &job, tbl1, 1,
-                vec![TempVector::new_from_entries(&job, vec![vec![4]])]).unwrap();
-            db.commit(trans1).unwrap();
-        }
-        {
-            let mut trans2 = TransactionData::new();
-            assert_eq!(db.materialize_table(&mut trans2, &job, tbl1, vec![0]).unwrap()[0].clone().get_entries().unwrap(),
-                vec![vec![4]]);
-        }
+
+        let mut trans1 = TransactionData::new();
+        tbl1 = db.create_table(&mut trans1, &job, 1).unwrap();
+        db.insert_rows(&mut trans1, &job, tbl1, 1,
+            vec![TempVector::new_from_entries(&job, vec![vec![4]])]).unwrap();
+        db.commit(trans1).unwrap();
+
+        let mut trans2 = TransactionData::new();
+        assert_eq!(db.materialize_table(&mut trans2, &job, tbl1, vec![0]).unwrap()[0].clone().get_entries().unwrap(),
+            vec![vec![4]]);
     }
 
     #[test]
     fn trans_2() {
         let db = new_db();
         let job = new_job();
-        let tbl1;
-        {
-            let mut trans1 = TransactionData::new();
-            tbl1 = db.create_table(&mut trans1, &job, 1).unwrap();
-            db.insert_rows(&mut trans1, &job, tbl1, 1,
-                vec![TempVector::new_from_entries(&job, vec![vec![4]])]).unwrap();
-            // NO commit
-        }
-        {
-            let mut trans2 = TransactionData::new();
-            assert_eq!(db.materialize_table(&mut trans2, &job, tbl1, vec![0]).unwrap()[0].clone().get_entries().unwrap(),
-                Vec::<Vec<u8>>::new());
-        }
+
+        let mut trans1 = TransactionData::new();
+        let tbl1 = db.create_table(&mut trans1, &job, 1).unwrap();
+        db.insert_rows(&mut trans1, &job, tbl1, 1,
+            vec![TempVector::new_from_entries(&job, vec![vec![4]])]).unwrap();
+        mem::drop(trans1); // NO commit
+
+        let mut trans2 = TransactionData::new();
+        assert_eq!(db.materialize_table(&mut trans2, &job, tbl1, vec![0]).unwrap()[0].clone().get_entries().unwrap(),
+            Vec::<Vec<u8>>::new());
     }
+
+    // #[test]
+    // fn trans_two_tables() {
+    //     let db = new_db();
+    //     let job = new_job();
+    //     let mut trans1 = TransactionData::new();
+    //     let mut trans2 = TransactionData::new();
+    //     let tbl1 = db.create_table(&mut trans1, &job, 2).unwrap();
+    //     let tbl2 = db.create_table(&mut trans2, &job, 2).unwrap();
+    //     assert!(tbl1 != tbl2);
+    //     db.commit(trans1).unwrap();
+    //     db.commit(trans2).unwrap();
+    // }
+    //
+    // #[test]
+    // fn trans_read_check() {
+    //     let db = new_db();
+    //     let job = new_job();
+    //     let mut trans1 = TransactionData::new();
+    //     let tbl = db.create_table(&mut trans1, &job, 1).unwrap();
+    //     db.commit(trans1).unwrap();
+    //     let mut trans2 = TransactionData::new();
+    //     let mut trans3 = TransactionData::new();
+    //     db.insert_rows(&mut trans2, &job, tbl, 1,
+    //         vec![TempVector::new_from_entries(&job, vec![vec![4]])]).unwrap();
+    //     db.insert_rows(&mut trans3, &job, tbl, 1,
+    //         vec![TempVector::new_from_entries(&job, vec![vec![5]])]).unwrap();
+    //     db.commit(trans2).unwrap();
+    //     db.commit(trans3).unwrap();
+    // }
 }

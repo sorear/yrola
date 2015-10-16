@@ -13,6 +13,7 @@ mod mvcc;
 
 // TODO provide a central log mechanism
 // TODO provide a mechanism for corruption errors to trigger read only
+// TODO institute provenance system, None provenance turns corruption errors into something else
 #[derive(Debug,Clone)]
 pub enum Error {
     // TODO Corruption errors frequently have less information than they could.  Audit

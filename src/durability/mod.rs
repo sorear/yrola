@@ -24,6 +24,7 @@ pub trait DurReadSection {
 }
 
 pub trait DurPrewriteVector {
+    // TODO: we may want richer file identifications
     fn id(&self) -> u64;
     fn data(&self) -> &PersistVector;
     fn dynamic(self: Box<Self>) -> Box<Any>;
@@ -31,15 +32,9 @@ pub trait DurPrewriteVector {
 
 pub trait DurPrepareSection {
     // file may not actually be written here, regardless a ref will be taken
-    // TODO: we may want richer file identifications
-    fn save_vector(&mut self, cookie: Box<DurPrewriteVector>) -> Result<()>;
-
-    fn del_vector(&mut self, filenum: u64) -> Result<()>;
-
-    // TODO we may want types, ability to store fancy metadata like version and endianness
-    fn add_journal_item(&mut self, jtype: u8, data: &[u8]) -> Result<u64>;
-
-    fn del_journal_item(&mut self, jinum: u64) -> Result<()>;
+    // done in a single step for atomicity.
+    fn prepare(&mut self, new_journal: Vec<(u8,Vec<u8>)>, del_journal: Vec<u64>,
+               new_vector: Vec<Box<DurPrewriteVector>>, del_vector: Vec<u64>) -> Result<()>;
 
     // TODO Rust does not subtype here
     fn is_read(&mut self) -> &mut DurReadSection;
@@ -104,28 +99,32 @@ impl DurReadSection for NoneSection {
 }
 
 impl DurPrepareSection for NoneSection {
-    fn save_vector(&mut self, cookie: Box<DurPrewriteVector>) -> Result<()> {
-        let prewrite : Box<NonePrewrite> = cookie.dynamic().downcast().unwrap(); // will panic if you passed a bogus cookie
-        assert!(prewrite.provider == self.1);
-        self.0.files.insert(prewrite.id, prewrite.data);
-        Ok(())
-    }
-
     fn is_read(&mut self) -> &mut DurReadSection { self }
 
-    fn del_vector(&mut self, filenum: u64) -> Result<()> {
-        self.0.files.remove(&filenum).map(|_| ()).ok_or_else(|| ::corruption("no such vector"))
-    }
+    fn prepare(&mut self, new_journal: Vec<(u8,Vec<u8>)>, del_journal: Vec<u64>,
+               new_vector: Vec<Box<DurPrewriteVector>>, del_vector: Vec<u64>) -> Result<()> {
+        for (jtype, data) in new_journal {
+            self.0.next_item += 1;
+            let num = self.0.next_item;
+            self.0.items.insert(num, (jtype, data));
+        }
 
-    fn add_journal_item(&mut self, jtype: u8, data: &[u8]) -> Result<u64> {
-        self.0.next_item += 1;
-        let num = self.0.next_item;
-        self.0.items.insert(num, (jtype, Vec::from(data)));
-        Ok(self.0.next_item)
-    }
+        for jinum in del_journal {
+            self.0.items.remove(&jinum);
+        }
 
-    fn del_journal_item(&mut self, jinum: u64) -> Result<()> {
-        self.0.items.remove(&jinum);
+        for cookie in new_vector {
+            let prewrite : Box<NonePrewrite> = cookie.dynamic().downcast().unwrap(); // will panic if you passed a bogus cookie
+            assert!(prewrite.provider == self.1);
+            self.0.files.insert(prewrite.id, prewrite.data);
+        }
+
+        for filenum in del_vector {
+            if self.0.files.remove(&filenum).is_none() {
+                unimplemented!()
+            }
+        }
+
         Ok(())
     }
 }
