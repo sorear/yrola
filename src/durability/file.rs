@@ -16,3 +16,40 @@
 
 // If snapshot NNN exists and is complete, then journals and snapshots <NNN are redundant and
 // should be deleted.  Incomplete snapshots should be deleted on startup.
+
+use vfs;
+
+struct FlushedJEnt {
+    id_in_file: u64, // may differ from user-level id b/c pre-flush deletion
+    type: u8,
+    data: Vec<u8>,
+}
+
+struct PendingJEnt {
+    type: u8,
+    data: Vec<u8>,
+}
+
+struct FileDurLocked {
+    flushed_jents: HashMap<u64, FlushedJEnt>,
+    pending_jents: HashMap<u64, Option<PendingJEnt>>,
+    pending_files: HashMap<u64, Option<Vec<u8>>>,
+    pre_commit_hook: Option<Box<Fn()>>,
+
+    journal_data_bytes: u64, // size of open journal if rewritten right now
+    journal_size: u64,
+
+    open_journal: vfs::File,
+    open_lock: vfs::File,
+}
+
+struct FileDurBody {
+    locked: Mutex<FileDurLocked>, // TODO: make fine-grained
+}
+
+#[derive(Clone)]
+pub struct FileDurProvider(Arc<FileDurBody>);
+
+impl FileDurProvider {
+    fn 
+}

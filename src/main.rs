@@ -7,6 +7,7 @@ use std::io::Error as IoError;
 use std::sync::Arc;
 
 mod misc;
+mod vfs;
 mod vector;
 mod durability;
 mod mvcc;
