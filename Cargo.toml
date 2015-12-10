@@ -4,5 +4,4 @@ version = "0.1.0"
 authors = ["Stefan O'Rear <stefanor@cox.net>"]
 
 [dependencies]
-rmp = "^0.7.2"
-byteorder = "^0.3.13"
+fs2 = "0.2.2"
