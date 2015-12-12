@@ -2,6 +2,11 @@
 name = "yrola"
 version = "0.1.0"
 authors = ["Stefan O'Rear <stefanor@cox.net>"]
+build = "build.rs"
+
+[build-dependencies]
+capnpc = "0.5.1"
 
 [dependencies]
 fs2 = "0.2.2"
+capnp = "0.5.1"

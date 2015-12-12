@@ -3,9 +3,9 @@ use std::path::{Path, PathBuf};
 use std::io::{self, ErrorKind, Read};
 use std::result;
 use std::str::FromStr;
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use fs2::FileExt;
-use std::arc::Arc;
+use std::sync::Arc;
 
 pub struct Persister;
 
