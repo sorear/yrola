@@ -22,43 +22,84 @@ struct LogBlock {
   }
 }
 
+# we miiiight provide structured headers later if it proves necessary
 struct InlineItem {
   id @0 :UInt64;
-  type @1 :UInt16;
+  header @1 :Data;
   data @2 :Data;
 }
 
 struct ExternalItem {
   id @0 :UInt64;
-  type @1 :UInt16;
+  header @1 :Data;
   size @2 :UInt64;
   hash @3 : UInt64;
 }
 
 # Table manager
 
-struct ColumnRun {
-  # will need to turn this into a b-tree in some cases. page alignment bah
+struct ItemHeader {
+  union {
+    level :group {
+      startStamp @0 :UInt64;
+      endStamp @1 :UInt64;
+      height @2 :UInt32;
+    }
+    bundle :group {
+      startStamp @3 :UInt64;
+      endStamp @4 :UInt64;
+      height @5 :UInt32;
+    }
+    configuration :group {
+      tableOfTablesId @6 :UInt64;
+      # CREATE TABLE _tables ("name" STRING PRIMARY KEY, "desc" BLOB)
+      historyRetentionSeconds @7 :Float64;
+    }
+  }
+}
+
+# a level might not know anything about stamps, if it's part of an uncommited txn
+struct Level {
+  tablesChanged @0 :List(LevelTableChange);
+  tablesDropped @1 :List(UInt64);
+}
+
+struct Bundle {
+  levels @0 :List(Level);
+}
+
+# creates table, asserts appropriate column orders
+struct LevelTableChange {
+  tableId @0 :UInt64;
+
+  keyCount @1 :UInt32;
+  columnOrder @2 :List(UInt32);
+
+  upsertData @3 :List(LevelColumn); # keys, column data
+  deleteData @4 :List(LevelColumn); # just the keys
+
+  # TODO (soon): Timeout columns for snapshot isolation
+}
+
+struct LevelColumn {
   bits @0 :Data;
 }
 
-struct TableRun {
-  tableSchema @0 :UInt64;
-  firstPkey @1 :Data;
-  #tableInstance @0 :UInt64; # 0 = multi-instance, instance ID added after pkey
-
-  hasTimestamps @2 :Bool; # adds timestamp after PK
-  pkeyCount @3 :UInt32;
-  columnCount @4 :UInt32;
-
-  upserts @5 :List(ColumnRun);
-  deletes @6 :List(ColumnRun);
-  touches @7 :List(ColumnRun);
-  watches @8 :List(ColumnRun);
-}
-
-struct Run {
-  tables @0 :List(TableRun);
-}
-
 # Schemas
+
+struct TableSpec {
+  lowId @0 :UInt64;
+  columnsSpec @1 :List(ColumnSpec);
+  indicesSpec @2 :List(IndexSpec);
+}
+
+struct ColumnSpec {
+  name @0 :Text;
+  lowId @1 :UInt32;
+  isPrimaryKey @2 :Bool;
+}
+
+struct IndexSpec {
+  lowId @0 :UInt64;
+  keyColumns @1 :List(UInt32);
+}

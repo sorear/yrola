@@ -33,7 +33,15 @@ pub enum ValueHandle {
 }
 
 impl ValueHandle {
-    pub fn get_type(&self) -> u16 {
+    pub fn new(data: &[u8]) -> ValueHandle {
+        unimplemented!()
+    }
+
+    pub fn id(&self) -> u64 {
+        unimplemented!()
+    }
+
+    pub fn header(&self) -> &[u8] {
         unimplemented!()
     }
 
@@ -42,12 +50,28 @@ impl ValueHandle {
     }
 }
 
-pub struct ValueIterator<'a> {
+pub struct ItemHandle;
+
+impl ItemHandle {
+    pub fn id(&self) -> u64 {
+        unimplemented!()
+    }
+
+    pub fn header(&self) -> &[u8] {
+        unimplemented!()
+    }
+
+    pub fn body(&self) -> &ValueHandle {
+        unimplemented!()
+    }
+}
+
+pub struct ItemIterator<'a> {
     guts: &'a (),
 }
-impl<'a> Iterator for ValueIterator<'a> {
-    type Item = ValueHandle;
-    fn next(&mut self) -> Option<ValueHandle> {
+impl<'a> Iterator for ItemIterator<'a> {
+    type Item = ItemHandle;
+    fn next(&mut self) -> Option<ItemHandle> {
         unimplemented!()
     }
 }
@@ -55,8 +79,9 @@ impl<'a> Iterator for ValueIterator<'a> {
 pub struct Transaction {
     guts: (),
 }
+
 impl Transaction {
-    pub fn add_item(&mut self, type_code: u16, data: Vec<u8>) -> Result<u64> {
+    pub fn add_item(&mut self, header: Vec<u8>, data: Vec<u8>) -> Result<u64> {
         unimplemented!()
     }
 
@@ -64,11 +89,11 @@ impl Transaction {
         unimplemented!()
     }
 
-    pub fn get_item(&mut self, id: u64) -> Result<ValueHandle> {
+    pub fn get_item(&mut self, id: u64) -> Result<ItemHandle> {
         unimplemented!()
     }
 
-    pub fn list_items<'a>(&'a mut self, type_code: u16) -> Result<ValueIterator<'a>> {
+    pub fn list_items<'a>(&'a mut self) -> Result<ItemIterator<'a>> {
         unimplemented!()
     }
 
