@@ -61,7 +61,6 @@ struct ItemHeader {
 # a level might not know anything about stamps, if it's part of an uncommited txn
 struct Level {
   tablesChanged @0 :List(LevelTableChange);
-  tablesDropped @1 :List(UInt64);
 }
 
 struct Bundle {
@@ -71,6 +70,8 @@ struct Bundle {
 # creates table, asserts appropriate column orders
 struct LevelTableChange {
   tableId @0 :UInt64;
+  dropped @5 :Bool;
+  created @6 :Bool; # if dropped and not created, everything else is dead
 
   keyCount @1 :UInt32;
   columnOrder @2 :List(UInt32);

@@ -6,6 +6,9 @@ use std::str::FromStr;
 use std::collections::{HashSet, HashMap};
 use fs2::FileExt;
 use std::sync::Arc;
+use std::slice;
+use capnp;
+use std::ops::Deref;
 
 pub struct Persister;
 
@@ -23,46 +26,63 @@ pub enum Error {
 
 pub type Result<T> = result::Result<T, Error>;
 
+struct FileControl;
+
+#[derive(Clone)]
 pub enum ValueHandle {
     SmallData {
-        data: (),
+        data: Arc<Vec<u8>>,
     },
     LargeData {
-        pointer: (),
+        file: Arc<FileControl>,
     },
 }
 
 impl ValueHandle {
     pub fn new(data: &[u8]) -> ValueHandle {
+        ValueHandle::SmallData { data: Arc::new(Vec::from(data)) }
+    }
+
+    pub fn new_words(data: &[capnp::Word]) -> ValueHandle {
         unimplemented!()
     }
 
-    pub fn id(&self) -> u64 {
-        unimplemented!()
+    // will be retooled when adding mmap support ...
+    pub fn data(&self) -> Result<&[u8]> {
+        match *self {
+            ValueHandle::SmallData { data: ref rc } => Ok(rc.deref()),
+            ValueHandle::LargeData { file: ref fl } => unimplemented!(),
+        }
     }
 
-    pub fn header(&self) -> &[u8] {
-        unimplemented!()
-    }
-
-    pub fn read_copy(&self) -> Result<Vec<u8>> {
-        unimplemented!()
+    pub fn data_words(&self) -> Result<&[capnp::Word]> {
+        let byteslice = try!(self.data());
+        Ok(unsafe {
+            assert!(((byteslice.as_ptr() as usize) & 7) == 0); // most allocators will align all memory this much
+            slice::from_raw_parts(byteslice.as_ptr() as *const capnp::Word,
+                                  byteslice.len() >> 3)
+        })
     }
 }
 
-pub struct ItemHandle;
+#[derive(Clone)]
+pub struct ItemHandle {
+    id: u64,
+    header: ValueHandle,
+    body: ValueHandle,
+}
 
 impl ItemHandle {
     pub fn id(&self) -> u64 {
-        unimplemented!()
+        self.id
     }
 
-    pub fn header(&self) -> &[u8] {
-        unimplemented!()
+    pub fn header(&self) -> &ValueHandle {
+        &self.header
     }
 
     pub fn body(&self) -> &ValueHandle {
-        unimplemented!()
+        &self.body
     }
 }
 
@@ -102,21 +122,9 @@ impl Transaction {
     }
 }
 
-enum ObjectStorage {
-    Memory {
-        buf: Arc<Vec<u8>>,
-    },
-    File {
-        id: u64,
-        size: u64,
-        hash: u64,
-    },
-}
-
 struct ObjectInfo {
-    type_code: u16,
     journal_id: u64,
-    storage: ObjectStorage,
+    data: ItemHandle,
 }
 
 struct TombstoneInfo {
@@ -124,9 +132,10 @@ struct TombstoneInfo {
 }
 
 struct SegmentInfo {
+    // dead objects are important because they force us to keep the tombstones around.  dead tombstones have no such requirement
     live_object_ids: HashSet<u64>,
     dead_object_ids: HashSet<u64>,
-    tombstone_ids: HashSet<u64>,
+    live_tombstone_ids: HashSet<u64>,
     on_disk_size: u64,
 }
 
