@@ -58,7 +58,7 @@ impl<'b> LevelReader<'b> {
             Some(ix) => {
                 let bundle_r: bundle::Reader<'a> = try!(self.reader.get_root());
                 let list_r = try!(bundle_r.get_levels());
-                if ix < 0 || ix >= list_r.len() {
+                if ix >= list_r.len() {
                     unimplemented!()
                 }
                 Ok(list_r.get(ix))
@@ -102,13 +102,13 @@ pub struct TableMetadata {
 pub enum Error {}
 
 impl From<capnp::Error> for Error {
-    fn from(err: capnp::Error) -> Error {
+    fn from(_err: capnp::Error) -> Error {
         unimplemented!()
     }
 }
 
 impl From<persist::Error> for Error {
-    fn from(err: persist::Error) -> Error {
+    fn from(_err: persist::Error) -> Error {
         unimplemented!()
     }
 }
@@ -143,7 +143,7 @@ impl Transaction {
         return Ok(false);
     }
 
-    pub fn create_table(&mut self, options: TableCreateOptions) -> Result<u64> {
+    pub fn create_table(&mut self, _options: TableCreateOptions) -> Result<u64> {
         unimplemented!()
     }
 

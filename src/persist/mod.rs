@@ -7,14 +7,18 @@ use std::collections::{HashSet, HashMap};
 use fs2::FileExt;
 use std::sync::Arc;
 use std::slice;
+use std::ffi::OsStr;
 use capnp;
 use std::ops::Deref;
 
-pub struct Persister;
-
+#[derive(Debug)]
 pub enum Error {
     BaseIsNotDir(PathBuf),
     BaseStatFailed(PathBuf, io::Error),
+    CreateBaseFailed(PathBuf, io::Error),
+    CreateLogDirFailed(PathBuf, io::Error),
+    CreateObjDirFailed(PathBuf, io::Error),
+    CreateLockFileFailed(PathBuf, io::Error),
     LockOpenFailed(PathBuf, io::Error),
     LockFailed(PathBuf, io::Error),
     JournalOpendirFailed(PathBuf, io::Error),
@@ -22,6 +26,18 @@ pub enum Error {
     DeleteBadJournalFailed(PathBuf, io::Error),
     JournalOpenFailed(PathBuf, io::Error),
     JournalReadFailed(PathBuf, io::Error),
+}
+
+fn parse_object_filename(filename: &OsStr) -> Option<u64> {
+    filename.to_str().and_then(|filename_utf8| {
+        u64::from_str(filename_utf8).ok().and_then(|i| {
+            if format!("{:06}", i) == filename_utf8 {
+                Some(i)
+            } else {
+                None
+            }
+        })
+    })
 }
 
 pub type Result<T> = result::Result<T, Error>;
@@ -43,7 +59,7 @@ impl ValueHandle {
         ValueHandle::SmallData { data: Arc::new(Vec::from(data)) }
     }
 
-    pub fn new_words(data: &[capnp::Word]) -> ValueHandle {
+    pub fn new_words(_data: &[capnp::Word]) -> ValueHandle {
         unimplemented!()
     }
 
@@ -51,7 +67,7 @@ impl ValueHandle {
     pub fn data(&self) -> Result<&[u8]> {
         match *self {
             ValueHandle::SmallData { data: ref rc } => Ok(rc.deref()),
-            ValueHandle::LargeData { file: ref fl } => unimplemented!(),
+            ValueHandle::LargeData { file: ref _fl } => unimplemented!(),
         }
     }
 
@@ -101,15 +117,15 @@ pub struct Transaction {
 }
 
 impl Transaction {
-    pub fn add_item(&mut self, header: Vec<u8>, data: Vec<u8>) -> Result<u64> {
+    pub fn add_item(&mut self, _header: Vec<u8>, _data: Vec<u8>) -> Result<u64> {
         unimplemented!()
     }
 
-    pub fn del_item(&mut self, id: u64) -> Result<()> {
+    pub fn del_item(&mut self, _id: u64) -> Result<()> {
         unimplemented!()
     }
 
-    pub fn get_item(&mut self, id: u64) -> Result<ItemHandle> {
+    pub fn get_item(&mut self, _id: u64) -> Result<ItemHandle> {
         unimplemented!()
     }
 
@@ -139,7 +155,13 @@ struct SegmentInfo {
     on_disk_size: u64,
 }
 
-struct JournalInfo {
+pub struct Persister {
+    lock_path: PathBuf,
+    wals_path: PathBuf,
+    objs_path: PathBuf,
+
+    lock_file: File,
+
     segments: HashMap<u64, SegmentInfo>,
     objects: HashMap<u64, ObjectInfo>,
     tombstones: HashMap<u64, TombstoneInfo>,
@@ -151,6 +173,10 @@ impl Persister {
     }
 
     pub fn open(root: &Path, readonly: bool) -> Result<Self> {
+        let lock_path = root.join("yrola.lock");
+        let wals_path = root.join("wals");
+        let objs_path = root.join("objs");
+
         match fs::metadata(root) {
             Ok(meta) => {
                 if !meta.is_dir() {
@@ -159,39 +185,46 @@ impl Persister {
             }
             Err(err) => {
                 if err.kind() == ErrorKind::NotFound && !readonly {
-                    unimplemented!();
+                    try!(fs::create_dir_all(root)
+                             .map_err(|e| Error::CreateBaseFailed(root.to_owned(), e)));
+                    try!(fs::create_dir_all(&wals_path)
+                             .map_err(|e| Error::CreateLogDirFailed(wals_path.clone(), e)));
+                    try!(fs::create_dir_all(&objs_path)
+                             .map_err(|e| Error::CreateObjDirFailed(objs_path.clone(), e)));
+                    try!(File::create(&lock_path)
+                             .map_err(|e| Error::CreateLockFileFailed(lock_path.clone(), e)));
                 } else {
                     return Err(Error::BaseStatFailed(root.to_owned(), err));
                 }
             }
         };
 
-        let locking_path = root.join("yrola.lock");
-        let locking_handle = try!(OpenOptions::new()
-                                      .write(true)
-                                      .open(&locking_path)
-                                      .map_err(|e| Error::LockOpenFailed(locking_path.clone(), e)));
-        try!(locking_handle.lock_exclusive()
-                           .map_err(|e| Error::LockFailed(locking_path.clone(), e)));
+        let lock_file = try!(OpenOptions::new()
+                                 .write(true)
+                                 .open(&lock_path)
+                                 .map_err(|e| Error::LockOpenFailed(lock_path.clone(), e)));
+        try!(lock_file.lock_exclusive()
+                      .map_err(|e| Error::LockFailed(lock_path.clone(), e)));
+
+        let pers = Persister {
+            lock_file: lock_file,
+            lock_path: lock_path.clone(),
+            objs_path: objs_path.clone(),
+            wals_path: wals_path.clone(),
+            segments: HashMap::new(),
+            objects: HashMap::new(),
+            tombstones: HashMap::new(),
+        };
 
         // read the logs
         let mut bad_journal_names = HashSet::new();
         let mut journal_names = Vec::new();
 
-        let wals_path = root.join("wals");
         let wals_iter = try!(fs::read_dir(&wals_path)
                                  .map_err(|e| Error::JournalOpendirFailed(wals_path.clone(), e)));
         for rentry in wals_iter {
             let entry = try!(rentry.map_err(|e| Error::JournalReaddirFailed(wals_path.clone(), e)));
-            match entry.file_name().to_str().and_then(|s| {
-                u64::from_str(s).ok().and_then(|i| {
-                    if format!("{:06}", i) == s {
-                        Some(i)
-                    } else {
-                        None
-                    }
-                })
-            }) {
+            match parse_object_filename(&*entry.file_name()) {
                 Some(jnum) => {
                     journal_names.push(jnum);
                 }
@@ -213,15 +246,18 @@ impl Persister {
             unimplemented!();
         }
 
-        unimplemented!();
-
         if !readonly {
             for badpath in bad_journal_names {
                 try!(fs::remove_file(&badpath)
                          .map_err(|e| Error::DeleteBadJournalFailed(badpath.clone(), e)));
             }
+
+            // TODO(now): Remove old objects
         }
 
-        unimplemented!()
+        Ok(pers)
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -7,6 +7,9 @@ build = "build.rs"
 [build-dependencies]
 capnpc = "0.5.1"
 
+[dev-dependencies]
+tempdir = "0.3.4"
+
 [dependencies]
 fs2 = "0.2.2"
 capnp = "0.5.1"
