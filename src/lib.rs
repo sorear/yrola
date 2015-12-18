@@ -1,6 +1,7 @@
 #![allow(dead_code)] // TODO(soon): remove
 extern crate fs2;
 extern crate capnp;
+extern crate byteorder;
 
 mod persist;
 mod table_mgr;
