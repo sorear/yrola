@@ -73,7 +73,10 @@ impl<'b> LevelReader<'b> {
             changed_reader.clone().get(ix as u32).get_table_id().cmp(&table_id)
         }) {
             Ok(ix) => Ok(changed_reader.clone().get(ix as u32)),
-            Err(_) => Ok(try!(level_table_change::Reader::get_from_pointer(&capnp::private::layout::PointerReader::new_default()))),
+            Err(_) => {
+                let nullp = capnp::private::layout::PointerReader::new_default();
+                Ok(try!(level_table_change::Reader::get_from_pointer(&nullp)))
+            }
         }
     }
 }

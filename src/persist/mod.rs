@@ -13,6 +13,8 @@ use std::ops::Deref;
 use byteorder::{LittleEndian, ByteOrder};
 use std::hash::{SipHasher, Hasher};
 use std::u32;
+use yrola_capnp;
+use std::cmp;
 
 #[derive(Debug)]
 pub enum Error {
@@ -32,6 +34,34 @@ pub enum Error {
     JournalWriteFailed(PathBuf, io::Error),
     JournalSyncFailed(PathBuf, io::Error),
     JournalTruncateFailed(PathBuf, io::Error),
+    Corrupt(Corruption, PathBuf),
+}
+
+#[derive(Debug)]
+pub enum Corruption {
+    LogBlockAfterEof,
+    DuplicateSegmentHeader,
+    MissingSegmentHeader,
+    CapnpError(capnp::Error),
+    DupObject {
+        id: u64,
+        other_file: PathBuf,
+    },
+    DupTombstone {
+        id: u64,
+        other_file: PathBuf,
+    },
+    UnclosedJournal {
+        read_error: LogBlockError,
+        read_pos: u64,
+    },
+    SegmentIncludesSelf,
+}
+
+fn wrap_capnp<S, E>(path: &PathBuf, res: result::Result<S, E>) -> Result<S>
+    where capnp::Error: From<E>
+{
+    res.map_err(|e| Error::Corrupt(Corruption::CapnpError(capnp::Error::from(e)), path.clone()))
 }
 
 fn parse_object_filename(filename: &OsStr) -> Option<u64> {
@@ -81,6 +111,10 @@ impl ValueHandle {
 
     pub fn new_words(data: &[capnp::Word]) -> ValueHandle {
         ValueHandle::new(word_to_byte_slice(data))
+    }
+
+    pub fn new_external(id: u64, size: u64, hash: u64) -> ValueHandle {
+        unimplemented!()
     }
 
     // will be retooled when adding mmap support ...
@@ -171,6 +205,11 @@ struct SegmentInfo {
     on_disk_size: u64,
 }
 
+struct OpenSegmentInfo {
+    id: u64,
+    offset: u64,
+}
+
 pub struct Persister {
     lock_path: PathBuf,
     wals_path: PathBuf,
@@ -181,6 +220,8 @@ pub struct Persister {
     segments: HashMap<u64, SegmentInfo>,
     objects: HashMap<u64, ObjectInfo>,
     tombstones: HashMap<u64, TombstoneInfo>,
+    highwater_object_id: u64,
+    open_segment: Option<OpenSegmentInfo>,
 }
 
 #[derive(Debug)]
@@ -312,6 +353,12 @@ fn truncate_log(journal: &mut File, journal_path: &PathBuf, journal_position: u6
     Ok(())
 }
 
+struct JournalReadResult {
+    end_code: LogBlockError,
+    end_pos: u64,
+    saw_eof: bool,
+}
+
 impl Persister {
     pub fn transaction(&self) -> Transaction {
         unimplemented!()
@@ -359,6 +406,8 @@ impl Persister {
             segments: HashMap::new(),
             objects: HashMap::new(),
             tombstones: HashMap::new(),
+            highwater_object_id: 0,
+            open_segment: None,
         };
 
         try!(pers.read_all_journals());
@@ -367,6 +416,154 @@ impl Persister {
         }
 
         Ok(pers)
+    }
+
+    fn journal_path(&self, id: u64) -> PathBuf {
+        self.wals_path.join(format!("{:06}", id))
+    }
+
+    fn read_journal(&mut self,
+                    journal_id: u64,
+                    expect_closed: bool,
+                    mut list_out: Option<&mut HashSet<u64>>)
+                    -> Result<(bool, u64)> {
+        let jpath = self.journal_path(journal_id);
+        let jfile = try!(File::open(&jpath)
+                             .map_err(|e| Error::JournalOpenFailed(jpath.clone(), e)));
+        let jmeta = try!(jfile.metadata().map_err(|e| Error::JournalOpenFailed(jpath.clone(), e)));
+        let (end_code, end_pos, jblocks) = try!(read_log_blocks_file(jfile, &jpath, journal_id));
+
+        assert!(!self.segments.contains_key(&journal_id));
+        self.segments.insert(journal_id,
+                             SegmentInfo {
+                                 live_object_ids: HashSet::new(),
+                                 dead_object_ids: HashSet::new(),
+                                 live_tombstone_ids: HashSet::new(),
+                                 on_disk_size: jmeta.len(),
+                             });
+
+        let mut saw_header = false;
+        let mut saw_eof = false;
+
+        for block in jblocks {
+            if saw_eof {
+                return Err(Error::Corrupt(Corruption::LogBlockAfterEof, jpath.clone()));
+            }
+
+            let rdr = try!(wrap_capnp(&jpath, capnp::serialize::read_message_from_words(&*block,
+                capnp::message::ReaderOptions::new())));
+            let log_block = try!(wrap_capnp(&jpath,
+                                            rdr.get_root::<yrola_capnp::log_block::Reader>()));
+
+            match try!(wrap_capnp(&jpath, log_block.which())) {
+                yrola_capnp::log_block::Which::Eof(_) => {
+                    saw_eof = true;
+                }
+
+                yrola_capnp::log_block::Which::SegmentHeader(seg_hdr) => {
+                    if saw_header {
+                        return Err(Error::Corrupt(Corruption::DuplicateSegmentHeader,
+                                                  jpath.clone()));
+                    }
+                    saw_header = true;
+                    self.highwater_object_id = cmp::max(self.highwater_object_id,
+                                                        seg_hdr.get_highest_ever_item_id());
+                    let list_r = try!(wrap_capnp(&jpath, seg_hdr.get_previous_segment_ids()));
+                    if let Some(ref mut id_set) = list_out {
+                        for ix in 0..list_r.len() {
+                            id_set.insert(list_r.get(ix));
+                        }
+                    }
+                }
+                yrola_capnp::log_block::Which::Commit(commit) => {
+                    let newi_rr = try!(wrap_capnp(&jpath, commit.get_new_inline()));
+                    for newi_r in newi_rr.iter() {
+                        try!(self.load_object(journal_id, ItemHandle {
+                            id: newi_r.get_id(),
+                            header: ValueHandle::new(try!(wrap_capnp(&jpath, newi_r.get_header()))),
+                            body: ValueHandle::new(try!(wrap_capnp(&jpath, newi_r.get_data()))),
+                        }));
+                    }
+
+                    let newe_rr = try!(wrap_capnp(&jpath, commit.get_new_external()));
+                    for newe_r in newe_rr.iter() {
+                        try!(self.load_object(journal_id, ItemHandle {
+                            id: newe_r.get_id(),
+                            header: ValueHandle::new(try!(wrap_capnp(&jpath, newe_r.get_header()))),
+                            body: ValueHandle::new_external(
+                                newe_r.get_id(),
+                                newe_r.get_size(),
+                                newe_r.get_hash(),
+                            )
+                        }));
+                    }
+
+                    let del_r = try!(wrap_capnp(&jpath, commit.get_deleted()));
+                    for ix in 0..del_r.len() {
+                        let del_id = del_r.get(ix);
+                        try!(self.load_tombstone(journal_id, del_id));
+                    }
+
+                    let obs_r = try!(wrap_capnp(&jpath, commit.get_obsolete_segment_ids()));
+                    if let Some(ref mut id_set) = list_out {
+                        for ix in 0..obs_r.len() {
+                            id_set.remove(&obs_r.get(ix));
+                        }
+                    }
+                }
+            }
+
+            if !saw_header {
+                return Err(Error::Corrupt(Corruption::MissingSegmentHeader, jpath.clone()));
+            }
+        }
+
+        if expect_closed {
+            if !saw_eof {
+                return Err(Error::Corrupt(Corruption::UnclosedJournal {
+                                              read_error: end_code,
+                                              read_pos: end_pos,
+                                          },
+                                          jpath.clone()));
+            }
+        }
+
+        Ok((saw_eof, end_pos))
+    }
+
+    fn load_object(&mut self, journal_id: u64, objh: ItemHandle) -> Result<()> {
+        let object_id = objh.id();
+        if let Some(old) = self.objects.get(&object_id) {
+            return Err(Error::Corrupt(Corruption::DupObject {
+                                          id: object_id,
+                                          other_file: self.journal_path(old.journal_id),
+                                      },
+                                      self.journal_path(journal_id)));
+        }
+
+        self.objects.insert(object_id,
+                            ObjectInfo {
+                                journal_id: journal_id,
+                                data: objh,
+                            });
+
+        self.segments.get_mut(&journal_id).unwrap().live_object_ids.insert(object_id);
+        Ok(())
+    }
+
+    fn load_tombstone(&mut self, journal_id: u64, object_id: u64) -> Result<()> {
+        if let Some(old) = self.tombstones.get(&object_id) {
+            return Err(Error::Corrupt(Corruption::DupTombstone {
+                                          id: object_id,
+                                          other_file: self.journal_path(old.journal_id),
+                                      },
+                                      self.journal_path(journal_id)));
+        }
+
+        self.tombstones.insert(object_id, TombstoneInfo { journal_id: journal_id });
+
+        self.segments.get_mut(&journal_id).unwrap().live_tombstone_ids.insert(object_id);
+        Ok(())
     }
 
     fn read_all_journals(&mut self) -> Result<()> {
@@ -387,19 +584,50 @@ impl Persister {
         journal_names.sort();
         journal_names.reverse();
 
-        for jnum in &journal_names {
-            let jpath = self.wals_path.join(format!("{:06}", jnum));
-            let jfile = try!(File::open(&jpath)
-                                 .map_err(|e| Error::JournalOpenFailed(jpath.clone(), e)));
-            let (_err, write_pos, jblocks) = try!(read_log_blocks_file(jfile, &jpath, *jnum));
+        let mut also_to_read = HashSet::new();
 
-            if jblocks.is_empty() {
+        for jnum in &journal_names {
+            let (closed, write_pos) = try!(self.read_journal(*jnum,
+                                                             false,
+                                                             Some(&mut also_to_read)));
+
+            if write_pos == 0 {
                 continue;
             }
-            // TODO(now): Read the journal
-            unimplemented!();
+
+            if !closed {
+                self.open_segment = Some(OpenSegmentInfo {
+                    id: *jnum,
+                    offset: write_pos,
+                });
+            }
+
+            if also_to_read.contains(jnum) {
+                return Err(Error::Corrupt(Corruption::SegmentIncludesSelf,
+                                          self.journal_path(*jnum)));
+            }
         }
-        // read any other logs specified
+
+        for also_jnum in also_to_read {
+            try!(self.read_journal(also_jnum, true, None));
+        }
+
+        for (deleted_id, tsinfo) in &self.tombstones {
+            match self.objects.get(deleted_id) {
+                Some(obj_info) => {
+                    // this is a deleted object
+                    // segment must exist for any object or tombstone
+                    let mut oseg = self.segments.get_mut(&obj_info.journal_id).unwrap();
+                    oseg.live_object_ids.remove(deleted_id);
+                    oseg.dead_object_ids.insert(*deleted_id);
+                }
+                None => {
+                    // no object so the tombstone is dead
+                    let mut tseg = self.segments.get_mut(&tsinfo.journal_id).unwrap();
+                    tseg.live_tombstone_ids.remove(deleted_id);
+                }
+            }
+        }
 
         Ok(())
     }
