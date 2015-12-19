@@ -12,6 +12,7 @@ use capnp;
 use byteorder::{LittleEndian, ByteOrder};
 use std::hash::{SipHasher, Hasher};
 use std::u32;
+use std::u64;
 use yrola_capnp;
 use std::cmp;
 use std::borrow::Borrow;
@@ -21,6 +22,8 @@ pub enum Error {
     Corrupt(Corruption, PathBuf),
     Io(IoType, PathBuf, io::Error),
     Disconnected,
+    JournalFull,
+    NoSuchKey(u64),
 }
 
 #[derive(Debug)]
@@ -86,12 +89,8 @@ struct FileControl {
 
 #[derive(Clone)]
 pub enum ValueHandle {
-    SmallData {
-        data: Arc<Vec<u8>>,
-    },
-    LargeData {
-        file: Arc<FileControl>,
-    },
+    SmallData(Arc<Vec<u8>>),
+    LargeData(Arc<FileControl>),
 }
 
 #[derive(Clone)]
@@ -102,7 +101,7 @@ pub struct ValuePin {
 #[derive(Clone)]
 pub struct ItemHandle {
     id: u64,
-    header: ValueHandle,
+    header: Arc<Vec<u8>>,
     body: ValueHandle,
 }
 
@@ -115,12 +114,18 @@ struct TombstoneInfo {
     journal_id: u64,
 }
 
+#[derive(Clone)]
 struct SegmentInfo {
     // dead objects are important because they force us to keep the tombstones around.
     // dead tombstones have no such requirement.
+    //
+    // must exist in .objects
     live_object_ids: HashSet<u64>,
+    // must not exist in .objects, must exist in .tombstones
     dead_object_ids: HashSet<u64>,
+    // must not exist in .objects, must exist in .tombstones
     live_tombstone_ids: HashSet<u64>,
+
     on_disk_size: u64,
 }
 
@@ -135,6 +140,13 @@ struct JournalConfig {
     app_version: u32,
 }
 
+const MAX_SEGMENT_CHANGES: usize = 1 << 28;
+
+// Naturally we need to track the live objects.  To support evacuation, we need
+// to be able to ask for any segment what live objects it contains and what
+// live tombstones it contains; a tombstone is live if a live segment contains
+// a matching dead object.
+
 pub struct Persister {
     lock_path: PathBuf,
     wals_path: PathBuf,
@@ -144,6 +156,7 @@ pub struct Persister {
 
     dir_control: Arc<ObjDirControl>,
     segments: HashMap<u64, SegmentInfo>,
+    // objects and tombstones are live only (after initial journal read)
     objects: HashMap<u64, ObjectInfo>,
     tombstones: HashMap<u64, TombstoneInfo>,
     highwater_object_id: u64,
@@ -212,11 +225,18 @@ impl ObjDirControl {
 
 impl ValueHandle {
     pub fn new(data: &[u8]) -> ValueHandle {
-        ValueHandle::SmallData { data: Arc::new(Vec::from(data)) }
+        ValueHandle::SmallData(Arc::new(Vec::from(data)))
     }
 
     pub fn new_words(data: &[capnp::Word]) -> ValueHandle {
         ValueHandle::new(word_to_byte_slice(data))
+    }
+
+    fn is_external(&self) -> bool {
+        match *self {
+            ValueHandle::SmallData(_) => false,
+            ValueHandle::LargeData(_) => true,
+        }
     }
 
     fn new_external(dir: Arc<ObjDirControl>, id: u64, size: u64, hash: u64) -> ValueHandle {
@@ -227,14 +247,14 @@ impl ValueHandle {
             hash: hash,
             loaded_data: Mutex::new(None),
         });
-        ValueHandle::LargeData { file: fc }
+        ValueHandle::LargeData(fc)
     }
 
     // will be retooled when adding mmap support ...
     pub fn pin(&self) -> Result<ValuePin> {
         match *self {
-            ValueHandle::SmallData { data: ref rc } => Ok(ValuePin { data: rc.clone() }),
-            ValueHandle::LargeData { file: ref fl } => {
+            ValueHandle::SmallData(ref rc) => Ok(ValuePin { data: rc.clone() }),
+            ValueHandle::LargeData(ref fl) => {
                 let mut data_lock = fl.loaded_data.lock().unwrap();
                 if let Some(ref data) = *data_lock {
                     return Ok(ValuePin { data: data.clone() });
@@ -274,8 +294,8 @@ impl ItemHandle {
         self.id
     }
 
-    pub fn header(&self) -> &ValueHandle {
-        &self.header
+    pub fn header(&self) -> &[u8] {
+        &*self.header
     }
 
     pub fn body(&self) -> &ValueHandle {
@@ -293,24 +313,39 @@ impl<'a> Iterator for ItemIterator<'a> {
     }
 }
 
-pub struct Transaction {
-    guts: (),
+pub struct Transaction<'a> {
+    journal: &'a mut Persister,
+    highwater_object_id: u64,
+    new_items: HashMap<u64, (Vec<u8>, Vec<u8>)>,
+    del_items: HashSet<u64>,
 }
 
-impl Transaction {
-    pub fn add_item(&mut self, _header: Vec<u8>, _data: Vec<u8>) -> Result<u64> {
-        unimplemented!()
+impl<'a> Transaction<'a> {
+    pub fn add_item(&mut self, header: Vec<u8>, data: Vec<u8>) -> Result<u64> {
+        if self.highwater_object_id == u64::MAX {
+            return Err(Error::JournalFull);
+        }
+        self.highwater_object_id += 1;
+        self.new_items.insert(self.highwater_object_id, (header, data));
+        Ok(self.highwater_object_id)
     }
 
-    pub fn del_item(&mut self, _id: u64) -> Result<()> {
-        unimplemented!()
+    pub fn del_item(&mut self, id: u64) -> Result<()> {
+        if self.new_items.remove(&id).is_some() {
+            Ok(())
+        } else if self.journal.objects.contains_key(&id) && !self.del_items.contains(&id) {
+            self.del_items.insert(id);
+            Ok(())
+        } else {
+            Err(Error::NoSuchKey(id))
+        }
     }
 
     pub fn get_item(&mut self, _id: u64) -> Result<ItemHandle> {
         unimplemented!()
     }
 
-    pub fn list_items<'a>(&'a mut self) -> Result<ItemIterator<'a>> {
+    pub fn list_items<'b>(&'b mut self) -> Result<ItemIterator<'b>> {
         unimplemented!()
     }
 
@@ -449,6 +484,12 @@ struct JournalReadResult {
     end_code: LogBlockError,
     end_pos: u64,
     saw_eof: bool,
+}
+
+impl OpenSegmentInfo {
+    fn write_block(&mut self, _count: usize, _block: &[capnp::Word]) -> Result<()> {
+        unimplemented!()
+    }
 }
 
 const YROLA_SIGNATURE: &'static [u8] = b"Yrola Journal format <0>\n";
@@ -593,9 +634,10 @@ impl Persister {
                 yrola_capnp::log_block::Which::Commit(commit) => {
                     let newi_rr = try!(wrap_capnp(&jpath, commit.get_new_inline()));
                     for newi_r in newi_rr.iter() {
+                        let hdr = try!(wrap_capnp(&jpath, newi_r.get_header()));
                         try!(self.load_object(journal_id, ItemHandle {
                             id: newi_r.get_id(),
-                            header: ValueHandle::new(try!(wrap_capnp(&jpath, newi_r.get_header()))),
+                            header: Arc::new(Vec::from(hdr)),
                             body: ValueHandle::new(try!(wrap_capnp(&jpath, newi_r.get_data()))),
                         }));
                     }
@@ -603,9 +645,10 @@ impl Persister {
                     let newe_rr = try!(wrap_capnp(&jpath, commit.get_new_external()));
                     for newe_r in newe_rr.iter() {
                         let dc = self.dir_control.clone();
+                        let hdr = try!(wrap_capnp(&jpath, newe_r.get_header()));
                         try!(self.load_object(journal_id, ItemHandle {
                             id: newe_r.get_id(),
-                            header: ValueHandle::new(try!(wrap_capnp(&jpath, newe_r.get_header()))),
+                            header: Arc::new(Vec::from(hdr)),
                             body: ValueHandle::new_external(
                                 dc,
                                 newe_r.get_id(),
@@ -664,6 +707,7 @@ impl Persister {
 
     fn load_object(&mut self, journal_id: u64, objh: ItemHandle) -> Result<()> {
         let object_id = objh.id();
+        self.highwater_object_id = cmp::max(self.highwater_object_id, object_id);
         if let Some(old) = self.objects.get(&object_id) {
             return Err(Error::Corrupt(Corruption::DupObject {
                                           id: object_id,
@@ -741,8 +785,9 @@ impl Persister {
             try!(self.read_journal(also_jnum, true, None));
         }
 
+        let mut stale_ts = Vec::new();
         for (deleted_id, tsinfo) in &self.tombstones {
-            match self.objects.get(deleted_id) {
+            match self.objects.remove(deleted_id) {
                 Some(obj_info) => {
                     // this is a deleted object
                     // segment must exist for any object or tombstone
@@ -753,9 +798,14 @@ impl Persister {
                 None => {
                     // no object so the tombstone is dead
                     let mut tseg = self.segments.get_mut(&tsinfo.journal_id).unwrap();
+                    stale_ts.push(*deleted_id);
                     tseg.live_tombstone_ids.remove(deleted_id);
                 }
             }
+        }
+
+        for deleted_id in stale_ts {
+            self.tombstones.remove(&deleted_id);
         }
 
         Ok(())
@@ -783,7 +833,7 @@ impl Persister {
         for rentry in objs_iter {
             let entry = try!(wrap_io(&self.objs_path, IoType::CleanupReaddir, rentry));
             if let Some(jnum) = parse_object_filename(&*entry.file_name()) {
-                if self.objects.contains_key(&jnum) && !self.tombstones.contains_key(&jnum) {
+                if self.objects.contains_key(&jnum) {
                     continue;
                 }
                 try!(wrap_io(&entry.path(),
@@ -792,6 +842,125 @@ impl Persister {
             }
         }
 
+        Ok(())
+    }
+
+    fn ensure_open_segment(&mut self, _changes: usize) -> Result<()> {
+        unimplemented!()
+    }
+
+    fn evacuate(&mut self, segment_id: u64) -> Result<()> {
+        // TODO(someday): the allocation here is almost certainly avoidable
+        let seginfo = self.segments.get(&segment_id).unwrap().clone();
+
+        let mut ext_count = 0usize;
+        for obj_id in &seginfo.live_object_ids {
+            if self.objects.get(obj_id).unwrap().data.body.is_external() {
+                ext_count += 1;
+            }
+        }
+        let inl_count = seginfo.live_object_ids.len() - ext_count;
+
+        let evac_count = seginfo.live_object_ids.len() + seginfo.live_tombstone_ids.len();
+        try!(self.ensure_open_segment(evac_count));
+
+        let mut msg_builder = capnp::message::Builder::new_default();
+
+        {
+            let block_builder = msg_builder.init_root::<yrola_capnp::log_block::Builder>();
+            let mut commit_builder = block_builder.init_commit();
+
+            {
+                // TODO(someday): Without the &mut the borrowck balks. ???
+                let mut inline_builder = (&mut commit_builder)
+                                             .borrow()
+                                             .init_new_inline(inl_count as u32);
+                let mut inline_ix = 0;
+
+                for obj_id in &seginfo.live_object_ids {
+                    let obj_data = &self.objects.get(obj_id).unwrap().data;
+                    match obj_data.body {
+                        ValueHandle::SmallData(ref data) => {
+                            let mut nin_builder = (&mut inline_builder).borrow().get(inline_ix);
+                            inline_ix += 1;
+                            nin_builder.set_id(obj_data.id);
+                            nin_builder.set_header(&*obj_data.header);
+                            nin_builder.set_data(&*data);
+                        }
+                        ValueHandle::LargeData(_) => {}
+                    }
+                }
+            }
+
+            {
+                let mut extern_builder = (&mut commit_builder)
+                                             .borrow()
+                                             .init_new_external(ext_count as u32);
+                let mut extern_ix = 0;
+
+                for obj_id in &seginfo.live_object_ids {
+                    let obj_data = &self.objects.get(obj_id).unwrap().data;
+                    match obj_data.body {
+                        ValueHandle::SmallData(_) => {}
+                        ValueHandle::LargeData(ref fc) => {
+                            let mut nex_builder = (&mut extern_builder).borrow().get(extern_ix);
+                            extern_ix += 1;
+                            nex_builder.set_id(obj_data.id);
+                            nex_builder.set_hash(fc.hash);
+                            nex_builder.set_size(fc.size);
+                            nex_builder.set_header(&*obj_data.header);
+                        }
+                    }
+                }
+            }
+
+            {
+                let mut ts_builder = (&mut commit_builder)
+                                         .borrow()
+                                         .init_deleted(seginfo.live_tombstone_ids.len() as u32);
+                let mut ts_ix = 0;
+                for ts_id in &seginfo.live_tombstone_ids {
+                    ts_builder.set(ts_ix, *ts_id);
+                    ts_ix += 1;
+                }
+            }
+
+            {
+                let mut obsseg_builder = (&mut commit_builder)
+                                             .borrow()
+                                             .init_obsolete_segment_ids(1);
+                obsseg_builder.set(0, segment_id);
+            }
+        }
+
+        let msg_words = capnp::serialize::write_message_to_words(&msg_builder);
+        let write_seg_id = self.open_segment.as_ref().unwrap().id;
+        try!(self.open_segment.as_mut().unwrap().write_block(evac_count, &*msg_words));
+        // if we get here, the old segment should be considered *not* part of the image
+
+        for moved_obj_id in &seginfo.live_object_ids {
+            self.objects.get_mut(moved_obj_id).unwrap().journal_id = write_seg_id;
+            self.segments.get_mut(&write_seg_id).unwrap().live_object_ids.insert(*moved_obj_id);
+        }
+
+        for moved_ts_id in &seginfo.live_tombstone_ids {
+            self.tombstones.get_mut(moved_ts_id).unwrap().journal_id = write_seg_id;
+            self.segments.get_mut(&write_seg_id).unwrap().live_tombstone_ids.insert(*moved_ts_id);
+        }
+
+        // these objects will never be seen again, so the corresponding tombstones are dead
+        for retired_obj_id in &seginfo.dead_object_ids {
+            let old_ts_info = self.tombstones.remove(retired_obj_id).unwrap();
+            if old_ts_info.journal_id != segment_id {
+                self.segments
+                    .get_mut(&old_ts_info.journal_id)
+                    .unwrap()
+                    .live_tombstone_ids
+                    .remove(retired_obj_id);
+            }
+        }
+
+        self.segments.remove(&segment_id);
         Ok(())
     }
 }
