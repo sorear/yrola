@@ -60,6 +60,7 @@ pub enum Corruption {
         read_pos: u64,
     },
     SegmentIncludesSelf,
+    BadSignature(String),
 }
 
 fn wrap_capnp<S, E>(path: &PathBuf, res: result::Result<S, E>) -> Result<S>
@@ -373,6 +374,8 @@ struct JournalReadResult {
     saw_eof: bool,
 }
 
+const YROLA_SIGNATURE: &'static [u8] = b"Yrola Journal format <0>\n";
+
 impl Persister {
     pub fn transaction(&self) -> Transaction {
         unimplemented!()
@@ -399,17 +402,33 @@ impl Persister {
                     try!(wrap_io(&objs_path,
                                  IoType::CreateObjDir,
                                  fs::create_dir_all(&objs_path)));
-                    try!(wrap_io(&lock_path, IoType::CreateLockFile, File::create(&lock_path)));
+                    let mut lock_file = try!(wrap_io(&lock_path,
+                                                     IoType::CreateLockFile,
+                                                     File::create(&lock_path)));
+                    try!(wrap_io(&lock_path,
+                                 IoType::CreateLockFile,
+                                 lock_file.write(YROLA_SIGNATURE)));
+                    try!(wrap_io(&lock_path, IoType::CreateLockFile, lock_file.sync_all()));
                 } else {
                     return wrap_io(&root_path, IoType::BaseStat, Err(err));
                 }
             }
         };
 
-        let lock_file = try!(wrap_io(&lock_path,
-                                     IoType::LockOpen,
-                                     OpenOptions::new().write(true).open(&lock_path)));
+        let mut lock_file = try!(wrap_io(&lock_path,
+                                         IoType::LockOpen,
+                                         OpenOptions::new().write(true).open(&lock_path)));
         try!(wrap_io(&lock_path, IoType::Lock, lock_file.lock_exclusive()));
+        {
+            let mut content = Vec::new();
+            try!(wrap_io(&lock_path,
+                         IoType::LockOpen,
+                         lock_file.read_to_end(&mut content)));
+            if content != YROLA_SIGNATURE {
+                let content_s = String::from_utf8_lossy(&*content).into_owned();
+                return Err(Error::Corrupt(Corruption::BadSignature(content_s), lock_path.clone()));
+            }
+        }
 
         let mut pers = Persister {
             lock_file: lock_file,
