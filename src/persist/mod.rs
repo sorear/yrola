@@ -18,27 +18,31 @@ use std::cmp;
 
 #[derive(Debug)]
 pub enum Error {
-    BaseIsNotDir(PathBuf),
-    BaseStatFailed(PathBuf, io::Error),
-    CreateBaseFailed(PathBuf, io::Error),
-    CreateLogDirFailed(PathBuf, io::Error),
-    CreateObjDirFailed(PathBuf, io::Error),
-    CreateLockFileFailed(PathBuf, io::Error),
-    LockOpenFailed(PathBuf, io::Error),
-    LockFailed(PathBuf, io::Error),
-    JournalOpendirFailed(PathBuf, io::Error),
-    JournalReaddirFailed(PathBuf, io::Error),
-    DeleteBadJournalFailed(PathBuf, io::Error),
-    JournalOpenFailed(PathBuf, io::Error),
-    JournalReadFailed(PathBuf, io::Error),
-    JournalWriteFailed(PathBuf, io::Error),
-    JournalSyncFailed(PathBuf, io::Error),
-    JournalTruncateFailed(PathBuf, io::Error),
     Corrupt(Corruption, PathBuf),
+    Io(IoType, PathBuf, io::Error),
+}
+
+#[derive(Debug)]
+pub enum IoType {
+    BaseStat,
+    CreateBase,
+    CreateLogDir,
+    CreateObjDir,
+    CreateLockFile,
+    LockOpen,
+    Lock,
+    JournalOpendir,
+    JournalReaddir,
+    JournalOpen,
+    JournalStat,
+    JournalRead,
+    JournalWrite,
+    JournalSync,
 }
 
 #[derive(Debug)]
 pub enum Corruption {
+    BaseNotDirectory,
     LogBlockAfterEof,
     DuplicateSegmentHeader,
     MissingSegmentHeader,
@@ -62,6 +66,10 @@ fn wrap_capnp<S, E>(path: &PathBuf, res: result::Result<S, E>) -> Result<S>
     where capnp::Error: From<E>
 {
     res.map_err(|e| Error::Corrupt(Corruption::CapnpError(capnp::Error::from(e)), path.clone()))
+}
+
+fn wrap_io<S>(path: &PathBuf, iotype: IoType, res: io::Result<S>) -> Result<S> {
+    res.map_err(|e| Error::Io(iotype, path.clone(), e))
 }
 
 fn parse_object_filename(filename: &OsStr) -> Option<u64> {
@@ -269,8 +277,9 @@ fn read_log_blocks_file(mut journal: File,
                         journal_id: u64)
                         -> Result<(LogBlockError, u64, Vec<Vec<capnp::Word>>)> {
     let mut jdata = Vec::new();
-    try!(journal.read_to_end(&mut jdata)
-                .map_err(|e| Error::JournalReadFailed(journal_path.clone(), e)));
+    try!(wrap_io(&journal_path,
+                 IoType::JournalRead,
+                 journal.read_to_end(&mut jdata)));
 
     let mut read_ptr = 0;
     let mut blocks = Vec::new();
@@ -332,24 +341,29 @@ fn write_log_block(journal: &mut File,
     let mut header = [0u8; 16];
     LittleEndian::write_u64(&mut header[0..8], leader);
     LittleEndian::write_u64(&mut header[8..16], block_hash);
-    try!(journal.seek(SeekFrom::Start(*journal_position))
-                .map_err(|e| Error::JournalWriteFailed(journal_path.clone(), e)));
-    try!(journal.write_all(&header)
-                .map_err(|e| Error::JournalWriteFailed(journal_path.clone(), e)));
-    try!(journal.write_all(byte_block)
-                .map_err(|e| Error::JournalWriteFailed(journal_path.clone(), e)));
-    try!(journal.sync_data().map_err(|e| Error::JournalSyncFailed(journal_path.clone(), e)));
+    try!(wrap_io(journal_path,
+                 IoType::JournalWrite,
+                 journal.seek(SeekFrom::Start(*journal_position))));
+    try!(wrap_io(journal_path,
+                 IoType::JournalWrite,
+                 journal.write_all(&header)));
+    try!(wrap_io(journal_path,
+                 IoType::JournalWrite,
+                 journal.write_all(byte_block)));
+    try!(wrap_io(journal_path, IoType::JournalSync, journal.sync_data()));
     *journal_position += 16 + byte_block.len() as u64;
     Ok(())
 }
 
 // call this if you fail to write an entry
 fn truncate_log(journal: &mut File, journal_path: &PathBuf, journal_position: u64) -> Result<()> {
-    try!(journal.seek(SeekFrom::Start(journal_position))
-                .map_err(|e| Error::JournalWriteFailed(journal_path.clone(), e)));
-    try!(journal.write_all(&[0xFFu8, 16])
-                .map_err(|e| Error::JournalWriteFailed(journal_path.clone(), e)));
-    try!(journal.sync_data().map_err(|e| Error::JournalSyncFailed(journal_path.clone(), e)));
+    try!(wrap_io(journal_path,
+                 IoType::JournalWrite,
+                 journal.seek(SeekFrom::Start(journal_position))));
+    try!(wrap_io(journal_path,
+                 IoType::JournalWrite,
+                 journal.write_all(&[0xFFu8, 16])));
+    try!(wrap_io(journal_path, IoType::JournalSync, journal.sync_data()));
     Ok(())
 }
 
@@ -365,6 +379,7 @@ impl Persister {
     }
 
     pub fn open(root: &Path, readonly: bool) -> Result<Self> {
+        let root_path = root.to_owned();
         let lock_path = root.join("yrola.lock");
         let wals_path = root.join("wals");
         let objs_path = root.join("objs");
@@ -372,31 +387,29 @@ impl Persister {
         match fs::metadata(root) {
             Ok(meta) => {
                 if !meta.is_dir() {
-                    return Err(Error::BaseIsNotDir(root.to_owned()));
+                    return Err(Error::Corrupt(Corruption::BaseNotDirectory, root.to_owned()));
                 }
             }
             Err(err) => {
                 if err.kind() == ErrorKind::NotFound && !readonly {
-                    try!(fs::create_dir_all(root)
-                             .map_err(|e| Error::CreateBaseFailed(root.to_owned(), e)));
-                    try!(fs::create_dir_all(&wals_path)
-                             .map_err(|e| Error::CreateLogDirFailed(wals_path.clone(), e)));
-                    try!(fs::create_dir_all(&objs_path)
-                             .map_err(|e| Error::CreateObjDirFailed(objs_path.clone(), e)));
-                    try!(File::create(&lock_path)
-                             .map_err(|e| Error::CreateLockFileFailed(lock_path.clone(), e)));
+                    try!(wrap_io(&root_path, IoType::CreateBase, fs::create_dir_all(root)));
+                    try!(wrap_io(&wals_path,
+                                 IoType::CreateLogDir,
+                                 fs::create_dir_all(&wals_path)));
+                    try!(wrap_io(&objs_path,
+                                 IoType::CreateObjDir,
+                                 fs::create_dir_all(&objs_path)));
+                    try!(wrap_io(&lock_path, IoType::CreateLockFile, File::create(&lock_path)));
                 } else {
-                    return Err(Error::BaseStatFailed(root.to_owned(), err));
+                    return wrap_io(&root_path, IoType::BaseStat, Err(err));
                 }
             }
         };
 
-        let lock_file = try!(OpenOptions::new()
-                                 .write(true)
-                                 .open(&lock_path)
-                                 .map_err(|e| Error::LockOpenFailed(lock_path.clone(), e)));
-        try!(lock_file.lock_exclusive()
-                      .map_err(|e| Error::LockFailed(lock_path.clone(), e)));
+        let lock_file = try!(wrap_io(&lock_path,
+                                     IoType::LockOpen,
+                                     OpenOptions::new().write(true).open(&lock_path)));
+        try!(wrap_io(&lock_path, IoType::Lock, lock_file.lock_exclusive()));
 
         let mut pers = Persister {
             lock_file: lock_file,
@@ -428,9 +441,8 @@ impl Persister {
                     mut list_out: Option<&mut HashSet<u64>>)
                     -> Result<(bool, u64)> {
         let jpath = self.journal_path(journal_id);
-        let jfile = try!(File::open(&jpath)
-                             .map_err(|e| Error::JournalOpenFailed(jpath.clone(), e)));
-        let jmeta = try!(jfile.metadata().map_err(|e| Error::JournalOpenFailed(jpath.clone(), e)));
+        let jfile = try!(wrap_io(&jpath, IoType::JournalOpen, File::open(&jpath)));
+        let jmeta = try!(wrap_io(&jpath, IoType::JournalStat, jfile.metadata()));
         let (end_code, end_pos, jblocks) = try!(read_log_blocks_file(jfile, &jpath, journal_id));
 
         assert!(!self.segments.contains_key(&journal_id));
@@ -569,13 +581,11 @@ impl Persister {
     fn read_all_journals(&mut self) -> Result<()> {
         // find the journal with the highest number containing at least one valid block
         let mut journal_names = Vec::new();
-        let wals_iter = try!(fs::read_dir(&self.wals_path).map_err(|e| {
-            Error::JournalOpendirFailed(self.wals_path.clone(), e)
-        }));
+        let wals_iter = try!(wrap_io(&self.wals_path,
+                                     IoType::JournalOpendir,
+                                     fs::read_dir(&self.wals_path)));
         for rentry in wals_iter {
-            let entry = try!(rentry.map_err(|e| {
-                Error::JournalReaddirFailed(self.wals_path.clone(), e)
-            }));
+            let entry = try!(wrap_io(&self.wals_path, IoType::JournalReaddir, rentry));
             if let Some(jnum) = parse_object_filename(&*entry.file_name()) {
                 journal_names.push(jnum);
             }
