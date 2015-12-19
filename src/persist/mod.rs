@@ -38,6 +38,9 @@ pub enum IoType {
     JournalRead,
     JournalWrite,
     JournalSync,
+    CleanupOpendir,
+    CleanupReaddir,
+    CleanupDelete,
 }
 
 #[derive(Debug)]
@@ -662,13 +665,37 @@ impl Persister {
     }
 
     fn clean_directories(&mut self) -> Result<()> {
-        // for badpath in bad_journal_names {
-        //     try!(fs::remove_file(&badpath)
-        //              .map_err(|e| Error::DeleteBadJournalFailed(badpath.clone(), e)));
-        // }
+        let wals_iter = try!(wrap_io(&self.wals_path,
+                                     IoType::CleanupOpendir,
+                                     fs::read_dir(&self.wals_path)));
+        for rentry in wals_iter {
+            let entry = try!(wrap_io(&self.wals_path, IoType::CleanupReaddir, rentry));
+            if let Some(jnum) = parse_object_filename(&*entry.file_name()) {
+                if self.segments.contains_key(&jnum) {
+                    continue;
+                }
+                try!(wrap_io(&entry.path(),
+                             IoType::CleanupDelete,
+                             fs::remove_file(entry.path())));
+            }
+        }
 
-        // TODO(now): Remove old objects
-        unimplemented!()
+        let objs_iter = try!(wrap_io(&self.objs_path,
+                                     IoType::CleanupOpendir,
+                                     fs::read_dir(&self.objs_path)));
+        for rentry in objs_iter {
+            let entry = try!(wrap_io(&self.objs_path, IoType::CleanupReaddir, rentry));
+            if let Some(jnum) = parse_object_filename(&*entry.file_name()) {
+                if self.objects.contains_key(&jnum) && !self.tombstones.contains_key(&jnum) {
+                    continue;
+                }
+                try!(wrap_io(&entry.path(),
+                             IoType::CleanupDelete,
+                             fs::remove_file(entry.path())));
+            }
+        }
+
+        Ok(())
     }
 }
 
