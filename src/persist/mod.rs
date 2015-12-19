@@ -129,6 +129,12 @@ struct OpenSegmentInfo {
     offset: u64,
 }
 
+#[derive(Clone, Default)]
+struct JournalConfig {
+    app_name: String,
+    app_version: u32,
+}
+
 pub struct Persister {
     lock_path: PathBuf,
     wals_path: PathBuf,
@@ -142,6 +148,7 @@ pub struct Persister {
     tombstones: HashMap<u64, TombstoneInfo>,
     highwater_object_id: u64,
     open_segment: Option<OpenSegmentInfo>,
+    config: JournalConfig,
 }
 
 #[derive(Debug)]
@@ -215,8 +222,10 @@ impl ValueHandle {
     fn new_external(dir: Arc<ObjDirControl>, id: u64, size: u64, hash: u64) -> ValueHandle {
         let fc = Arc::new(FileControl {
             dir_control: dir,
-            id: id, size: size, hash: hash,
-            loaded_data: Mutex::new(None)
+            id: id,
+            size: size,
+            hash: hash,
+            loaded_data: Mutex::new(None),
         });
         ValueHandle::LargeData { file: fc }
     }
@@ -509,6 +518,7 @@ impl Persister {
             highwater_object_id: 0,
             open_segment: None,
             dir_control: Arc::new(ObjDirControl::new(&objs_path)),
+            config: JournalConfig::default(),
         };
 
         try!(pers.read_all_journals());
@@ -525,7 +535,7 @@ impl Persister {
 
     fn read_journal(&mut self,
                     journal_id: u64,
-                    expect_closed: bool,
+                    closed_segment: bool,
                     mut list_out: Option<&mut HashSet<u64>>)
                     -> Result<(bool, u64)> {
         let jpath = self.journal_path(journal_id);
@@ -574,6 +584,11 @@ impl Persister {
                             id_set.insert(list_r.get(ix));
                         }
                     }
+
+                    if !closed_segment {
+                        try!(self.load_config(&jpath,
+                                              try!(wrap_capnp(&jpath, seg_hdr.get_config()))));
+                    }
                 }
                 yrola_capnp::log_block::Which::Commit(commit) => {
                     let newi_rr = try!(wrap_capnp(&jpath, commit.get_new_inline()));
@@ -612,6 +627,11 @@ impl Persister {
                             id_set.remove(&obs_r.get(ix));
                         }
                     }
+
+                    if !closed_segment && commit.has_new_config() {
+                        try!(self.load_config(&jpath,
+                                              try!(wrap_capnp(&jpath, commit.get_new_config()))));
+                    }
                 }
             }
 
@@ -620,7 +640,7 @@ impl Persister {
             }
         }
 
-        if expect_closed {
+        if closed_segment {
             if !saw_eof {
                 return Err(Error::Corrupt(Corruption::UnclosedJournal {
                                               read_error: end_code,
@@ -631,6 +651,15 @@ impl Persister {
         }
 
         Ok((saw_eof, end_pos))
+    }
+
+    fn load_config<'a>(&mut self,
+                       filename: &PathBuf,
+                       reader: yrola_capnp::journal_config::Reader<'a>)
+                       -> Result<()> {
+        self.config.app_name = try!(wrap_capnp(filename, reader.get_app_name())).to_owned();
+        self.config.app_version = reader.get_app_version();
+        Ok(())
     }
 
     fn load_object(&mut self, journal_id: u64, objh: ItemHandle) -> Result<()> {

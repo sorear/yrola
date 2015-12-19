@@ -11,15 +11,22 @@ struct LogBlock {
     segmentHeader :group {
       previousSegmentIds @0 :List(UInt64);
       highestEverItemId @6 :UInt64;
+      config @8 :JournalConfig;
     }
     commit :group {
       newInline @1 :List(InlineItem);
       newExternal @2 :List(ExternalItem);
       deleted @3 :List(UInt64);
       obsoleteSegmentIds @4 :List(UInt64);
+      newConfig @7 :JournalConfig;
     }
     eof @5 :Void;
   }
+}
+
+struct JournalConfig {
+  appName @0 :Text;
+  appVersion @1 :UInt32;
 }
 
 # we miiiight provide structured headers later if it proves necessary
