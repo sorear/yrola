@@ -1,6 +1,7 @@
-use persist::{self, ValueHandle};
+use persist::{self, ValueHandle, ValuePin};
 use std::result;
 use yrola_capnp::{level, bundle, level_table_change};
+use borrow_segments::{self, BorrowSegments};
 use capnp::serialize;
 use capnp::message;
 use capnp;
@@ -14,16 +15,17 @@ struct LevelHandle {
     bundle_index: Option<u32>,
 }
 
-struct LevelReader<'a> {
-    reader: message::Reader<serialize::SliceSegments<'a>>,
+struct LevelReader {
+    reader: message::Reader<BorrowSegments<ValuePin>>,
     bundle_index: Option<u32>,
 }
 
 impl LevelHandle {
-    fn get_level_reader<'a>(&'a self) -> Result<LevelReader<'a>> {
-        let slice = try!(self.value.data_words());
+    fn get_level_reader(&self) -> Result<LevelReader> {
+        let pin = try!(self.value.pin());
         Ok(LevelReader {
-            reader: try!(serialize::read_message_from_words(slice, message::ReaderOptions::new())),
+            reader: try!(borrow_segments::read_message_from_owner(pin,
+                                                                  message::ReaderOptions::new())),
             bundle_index: self.bundle_index,
         })
     }
@@ -51,7 +53,7 @@ fn binary_search_index<F>(to: usize, mut f: F) -> result::Result<usize, usize>
     Err(base)
 }
 
-impl<'b> LevelReader<'b> {
+impl LevelReader {
     fn get_level_ptr<'a>(&'a self) -> Result<level::Reader<'a>> {
         match self.bundle_index {
             None => Ok(try!(self.reader.get_root())),

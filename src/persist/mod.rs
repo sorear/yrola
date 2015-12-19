@@ -5,21 +5,22 @@ use std::result;
 use std::str::FromStr;
 use std::collections::{HashSet, HashMap};
 use fs2::FileExt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, RwLock};
 use std::slice;
 use std::ffi::OsStr;
 use capnp;
-use std::ops::Deref;
 use byteorder::{LittleEndian, ByteOrder};
 use std::hash::{SipHasher, Hasher};
 use std::u32;
 use yrola_capnp;
 use std::cmp;
+use std::borrow::Borrow;
 
 #[derive(Debug)]
 pub enum Error {
     Corrupt(Corruption, PathBuf),
     Io(IoType, PathBuf, io::Error),
+    Disconnected,
 }
 
 #[derive(Debug)]
@@ -41,6 +42,8 @@ pub enum IoType {
     CleanupOpendir,
     CleanupReaddir,
     CleanupDelete,
+    ObjectOpen,
+    ObjectRead,
 }
 
 #[derive(Debug)]
@@ -66,6 +69,90 @@ pub enum Corruption {
     BadSignature(String),
 }
 
+pub type Result<T> = result::Result<T, Error>;
+
+struct ObjDirControl {
+    disconnected: RwLock<bool>,
+    base_dir: PathBuf,
+}
+
+struct FileControl {
+    dir_control: Arc<ObjDirControl>,
+    id: u64,
+    size: u64,
+    hash: u64,
+    loaded_data: Mutex<Option<Arc<Vec<u8>>>>,
+}
+
+#[derive(Clone)]
+pub enum ValueHandle {
+    SmallData {
+        data: Arc<Vec<u8>>,
+    },
+    LargeData {
+        file: Arc<FileControl>,
+    },
+}
+
+#[derive(Clone)]
+pub struct ValuePin {
+    data: Arc<Vec<u8>>,
+}
+
+#[derive(Clone)]
+pub struct ItemHandle {
+    id: u64,
+    header: ValueHandle,
+    body: ValueHandle,
+}
+
+struct ObjectInfo {
+    journal_id: u64,
+    data: ItemHandle,
+}
+
+struct TombstoneInfo {
+    journal_id: u64,
+}
+
+struct SegmentInfo {
+    // dead objects are important because they force us to keep the tombstones around.
+    // dead tombstones have no such requirement.
+    live_object_ids: HashSet<u64>,
+    dead_object_ids: HashSet<u64>,
+    live_tombstone_ids: HashSet<u64>,
+    on_disk_size: u64,
+}
+
+struct OpenSegmentInfo {
+    id: u64,
+    offset: u64,
+}
+
+pub struct Persister {
+    lock_path: PathBuf,
+    wals_path: PathBuf,
+    objs_path: PathBuf,
+
+    lock_file: File,
+
+    dir_control: Arc<ObjDirControl>,
+    segments: HashMap<u64, SegmentInfo>,
+    objects: HashMap<u64, ObjectInfo>,
+    tombstones: HashMap<u64, TombstoneInfo>,
+    highwater_object_id: u64,
+    open_segment: Option<OpenSegmentInfo>,
+}
+
+#[derive(Debug)]
+pub enum LogBlockError {
+    IncompleteHeader,
+    IncompleteBody,
+    BadHeaderType,
+    BadHeaderHash,
+    BadBodyHash,
+}
+
 fn wrap_capnp<S, E>(path: &PathBuf, res: result::Result<S, E>) -> Result<S>
     where capnp::Error: From<E>
 {
@@ -88,20 +175,6 @@ fn parse_object_filename(filename: &OsStr) -> Option<u64> {
     })
 }
 
-pub type Result<T> = result::Result<T, Error>;
-
-struct FileControl;
-
-#[derive(Clone)]
-pub enum ValueHandle {
-    SmallData {
-        data: Arc<Vec<u8>>,
-    },
-    LargeData {
-        file: Arc<FileControl>,
-    },
-}
-
 fn word_to_byte_slice(sl: &[capnp::Word]) -> &[u8] {
     unsafe { slice::from_raw_parts(sl.as_ptr() as *const u8, sl.len() << 3) }
 }
@@ -116,6 +189,20 @@ fn byte_to_word_slice(byteslice: &[u8]) -> &[capnp::Word] {
     }
 }
 
+impl ObjDirControl {
+    fn new(path: &PathBuf) -> Self {
+        ObjDirControl {
+            base_dir: path.clone(),
+            disconnected: RwLock::new(false),
+        }
+    }
+
+    fn close(&self) {
+        let mut closed_lock = self.disconnected.write().unwrap();
+        *closed_lock = true;
+    }
+}
+
 impl ValueHandle {
     pub fn new(data: &[u8]) -> ValueHandle {
         ValueHandle::SmallData { data: Arc::new(Vec::from(data)) }
@@ -125,28 +212,52 @@ impl ValueHandle {
         ValueHandle::new(word_to_byte_slice(data))
     }
 
-    pub fn new_external(id: u64, size: u64, hash: u64) -> ValueHandle {
-        unimplemented!()
+    fn new_external(dir: Arc<ObjDirControl>, id: u64, size: u64, hash: u64) -> ValueHandle {
+        let fc = Arc::new(FileControl {
+            dir_control: dir,
+            id: id, size: size, hash: hash,
+            loaded_data: Mutex::new(None)
+        });
+        ValueHandle::LargeData { file: fc }
     }
 
     // will be retooled when adding mmap support ...
-    pub fn data(&self) -> Result<&[u8]> {
+    pub fn pin(&self) -> Result<ValuePin> {
         match *self {
-            ValueHandle::SmallData { data: ref rc } => Ok(rc.deref()),
-            ValueHandle::LargeData { file: ref _fl } => unimplemented!(),
-        }
-    }
+            ValueHandle::SmallData { data: ref rc } => Ok(ValuePin { data: rc.clone() }),
+            ValueHandle::LargeData { file: ref fl } => {
+                let mut data_lock = fl.loaded_data.lock().unwrap();
+                if let Some(ref data) = *data_lock {
+                    return Ok(ValuePin { data: data.clone() });
+                }
 
-    pub fn data_words(&self) -> Result<&[capnp::Word]> {
-        self.data().map(byte_to_word_slice)
+                let dcon_lock = fl.dir_control.disconnected.read().unwrap();
+                if *dcon_lock {
+                    return Err(Error::Disconnected);
+                }
+
+                let path = fl.dir_control.base_dir.join(format!("{:06}", fl.id));
+                let mut buf = Vec::new();
+                let mut fileh = try!(wrap_io(&path, IoType::ObjectOpen, File::open(&path)));
+                try!(wrap_io(&path, IoType::ObjectRead, fileh.read_to_end(&mut buf)));
+                let buf_arc = Arc::new(buf);
+                *data_lock = Some(buf_arc.clone());
+                Ok(ValuePin { data: buf_arc })
+            }
+        }
     }
 }
 
-#[derive(Clone)]
-pub struct ItemHandle {
-    id: u64,
-    header: ValueHandle,
-    body: ValueHandle,
+impl ValuePin {
+    pub fn data(&self) -> &[u8] {
+        &**self.data
+    }
+}
+
+impl Borrow<[capnp::Word]> for ValuePin {
+    fn borrow(&self) -> &[capnp::Word] {
+        byte_to_word_slice(self.data())
+    }
 }
 
 impl ItemHandle {
@@ -197,52 +308,6 @@ impl Transaction {
     pub fn commit(self) -> Result<()> {
         unimplemented!()
     }
-}
-
-struct ObjectInfo {
-    journal_id: u64,
-    data: ItemHandle,
-}
-
-struct TombstoneInfo {
-    journal_id: u64,
-}
-
-struct SegmentInfo {
-    // dead objects are important because they force us to keep the tombstones around.
-    // dead tombstones have no such requirement.
-    live_object_ids: HashSet<u64>,
-    dead_object_ids: HashSet<u64>,
-    live_tombstone_ids: HashSet<u64>,
-    on_disk_size: u64,
-}
-
-struct OpenSegmentInfo {
-    id: u64,
-    offset: u64,
-}
-
-pub struct Persister {
-    lock_path: PathBuf,
-    wals_path: PathBuf,
-    objs_path: PathBuf,
-
-    lock_file: File,
-
-    segments: HashMap<u64, SegmentInfo>,
-    objects: HashMap<u64, ObjectInfo>,
-    tombstones: HashMap<u64, TombstoneInfo>,
-    highwater_object_id: u64,
-    open_segment: Option<OpenSegmentInfo>,
-}
-
-#[derive(Debug)]
-pub enum LogBlockError {
-    IncompleteHeader,
-    IncompleteBody,
-    BadHeaderType,
-    BadHeaderHash,
-    BadBodyHash,
 }
 
 // we're using SipHash for its engineering properties, so a hard-coded key is not a big deal
@@ -443,6 +508,7 @@ impl Persister {
             tombstones: HashMap::new(),
             highwater_object_id: 0,
             open_segment: None,
+            dir_control: Arc::new(ObjDirControl::new(&objs_path)),
         };
 
         try!(pers.read_all_journals());
@@ -521,10 +587,12 @@ impl Persister {
 
                     let newe_rr = try!(wrap_capnp(&jpath, commit.get_new_external()));
                     for newe_r in newe_rr.iter() {
+                        let dc = self.dir_control.clone();
                         try!(self.load_object(journal_id, ItemHandle {
                             id: newe_r.get_id(),
                             header: ValueHandle::new(try!(wrap_capnp(&jpath, newe_r.get_header()))),
                             body: ValueHandle::new_external(
+                                dc,
                                 newe_r.get_id(),
                                 newe_r.get_size(),
                                 newe_r.get_hash(),
@@ -696,6 +764,12 @@ impl Persister {
         }
 
         Ok(())
+    }
+}
+
+impl Drop for Persister {
+    fn drop(&mut self) {
+        self.dir_control.close();
     }
 }
 
