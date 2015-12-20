@@ -43,6 +43,7 @@ pub enum IoType {
     SegmentRead,
     SegmentWrite,
     SegmentSync,
+    SegmentCreate,
     CleanupOpendir,
     CleanupReaddir,
     CleanupDelete,
@@ -71,6 +72,7 @@ pub enum Corruption {
     },
     SegmentIncludesSelf,
     BadSignature(String),
+    OverlongSegment,
 }
 
 pub type Result<T> = result::Result<T, Error>;
@@ -127,12 +129,17 @@ struct SegmentInfo {
     // must not exist in .objects, must exist in .tombstones
     live_tombstone_ids: HashSet<u64>,
 
+    // not valid for the open segment
     on_disk_size: u64,
 }
 
 struct OpenSegmentInfo {
     id: u64,
+    handle: File,
+    path: PathBuf,
     offset: u64,
+    changes: u32,
+    pending_truncate: bool,
 }
 
 #[derive(Clone, Default)]
@@ -159,6 +166,7 @@ pub struct Persister {
     objects: HashMap<u64, ObjectInfo>,
     tombstones: HashMap<u64, TombstoneInfo>,
     highwater_object_id: u64,
+    highwater_segment_id: u64,
     open_segment: Option<OpenSegmentInfo>,
     config: JournalConfig,
 }
@@ -174,10 +182,12 @@ pub enum LogBlockError {
 
 const YROLA_SIGNATURE: &'static [u8] = b"Yrola Journal format <0>\n";
 
-const MAX_SEGMENT_CHANGES: usize = 1 << 28;
+const MAX_SEGMENT_CHANGES: u32 = 1 << 20;
+const MAX_SEGMENT_COUNT: usize = 1 << 20;
 const MAX_HEADER_LEN: usize = 1 << 20;
 // TODO(someday): Tuning parameter
 const MAX_INLINE_LEN: usize = 1 << 20;
+const TARGET_SEGMENT_SIZE: u64 = 1 << 24;
 
 fn wrap_capnp<S, E>(path: &PathBuf, res: result::Result<S, E>) -> Result<S>
     where capnp::Error: From<E>
@@ -352,8 +362,8 @@ impl<'a> Transaction<'a> {
 
     pub fn commit(self) -> Result<()> {
         let count = self.new_inline.len() + self.del_items.len();
-        if count > MAX_SEGMENT_CHANGES {
-            return Err(Error::OversizeCommit(count, MAX_SEGMENT_CHANGES));
+        if count > MAX_SEGMENT_CHANGES as usize {
+            return Err(Error::OversizeCommit(count, MAX_SEGMENT_CHANGES as usize));
         }
 
         let mut msg_builder = capnp::message::Builder::new_default();
@@ -392,8 +402,8 @@ impl<'a> Transaction<'a> {
         }
 
         let msg_words = capnp::serialize::write_message_to_words(&msg_builder);
-        let write_seg_id = try!(self.journal.ensure_open_segment(count));
-        try!(self.journal.write_block(count, &*msg_words));
+        let write_seg_id = try!(self.journal.ensure_open_segment(count as u32));
+        try!(self.journal.write_block(count as u32, &*msg_words));
 
         // we wrote it to the journal, now update our data structures
         for (obj_id, (header, body)) in self.new_inline {
@@ -640,6 +650,7 @@ impl Persister {
             objects: HashMap::new(),
             tombstones: HashMap::new(),
             highwater_object_id: 0,
+            highwater_segment_id: 0,
             open_segment: None,
             dir_control: Arc::new(ObjDirControl::new(&objs_path)),
             config: JournalConfig::default(),
@@ -661,7 +672,7 @@ impl Persister {
                     segment_id: u64,
                     closed_segment: bool,
                     mut list_out: Option<&mut HashSet<u64>>)
-                    -> Result<(bool, u64)> {
+                    -> Result<(bool, u64, u32)> {
         let jpath = self.segment_path(segment_id);
         let jfile = try!(wrap_io(&jpath, IoType::SegmentOpen, File::open(&jpath)));
         let jmeta = try!(wrap_io(&jpath, IoType::SegmentStat, jfile.metadata()));
@@ -678,6 +689,7 @@ impl Persister {
 
         let mut saw_header = false;
         let mut saw_eof = false;
+        let mut change_counter = 0u32;
 
         for block in jblocks {
             if saw_eof {
@@ -716,6 +728,7 @@ impl Persister {
                 }
                 yrola_capnp::log_block::Which::Commit(commit) => {
                     let newi_rr = try!(wrap_capnp(&jpath, commit.get_new_inline()));
+                    change_counter += newi_rr.len();
                     for newi_r in newi_rr.iter() {
                         let hdr = try!(wrap_capnp(&jpath, newi_r.get_header()));
                         try!(self.load_object(segment_id, ItemHandle {
@@ -726,6 +739,7 @@ impl Persister {
                     }
 
                     let newe_rr = try!(wrap_capnp(&jpath, commit.get_new_external()));
+                    change_counter += newe_rr.len();
                     for newe_r in newe_rr.iter() {
                         let dc = self.dir_control.clone();
                         let hdr = try!(wrap_capnp(&jpath, newe_r.get_header()));
@@ -742,6 +756,7 @@ impl Persister {
                     }
 
                     let del_r = try!(wrap_capnp(&jpath, commit.get_deleted()));
+                    change_counter += del_r.len();
                     for ix in 0..del_r.len() {
                         let del_id = del_r.get(ix);
                         try!(self.load_tombstone(segment_id, del_id));
@@ -752,6 +767,10 @@ impl Persister {
                         for ix in 0..obs_r.len() {
                             id_set.remove(&obs_r.get(ix));
                         }
+                    }
+
+                    if change_counter > MAX_SEGMENT_CHANGES {
+                        return Err(Error::Corrupt(Corruption::OverlongSegment, jpath.clone()));
                     }
 
                     if !closed_segment && commit.has_new_config() {
@@ -776,7 +795,7 @@ impl Persister {
             }
         }
 
-        Ok((saw_eof, end_pos))
+        Ok((saw_eof, end_pos, change_counter))
     }
 
     fn load_config<'a>(&mut self,
@@ -786,6 +805,11 @@ impl Persister {
         self.config.app_name = try!(wrap_capnp(filename, reader.get_app_name())).to_owned();
         self.config.app_version = reader.get_app_version();
         Ok(())
+    }
+
+    fn save_config<'a>(&self, mut builder: yrola_capnp::journal_config::Builder<'a>) {
+        builder.set_app_name(&*self.config.app_name);
+        builder.set_app_version(self.config.app_version);
     }
 
     fn load_object(&mut self, segment_id: u64, objh: ItemHandle) -> Result<()> {
@@ -843,18 +867,26 @@ impl Persister {
         let mut also_to_read = HashSet::new();
 
         for jnum in &segment_names {
-            let (closed, write_pos) = try!(self.read_segment(*jnum,
-                                                             false,
-                                                             Some(&mut also_to_read)));
+            let (closed, write_pos, changes) = try!(self.read_segment(*jnum,
+                                                                      false,
+                                                                      Some(&mut also_to_read)));
 
             if write_pos == 0 {
                 continue;
             }
 
             if !closed {
+                let spath = self.segment_path(*jnum);
+                let writeh = try!(wrap_io(&spath,
+                                          IoType::SegmentOpen,
+                                          OpenOptions::new().write(true).open(&spath)));
                 self.open_segment = Some(OpenSegmentInfo {
                     id: *jnum,
                     offset: write_pos,
+                    handle: writeh,
+                    changes: changes,
+                    path: spath,
+                    pending_truncate: false,
                 });
             }
 
@@ -862,6 +894,10 @@ impl Persister {
                 return Err(Error::Corrupt(Corruption::SegmentIncludesSelf,
                                           self.segment_path(*jnum)));
             }
+
+            self.highwater_segment_id = *jnum;
+
+            break;
         }
 
         for also_jnum in also_to_read {
@@ -928,13 +964,153 @@ impl Persister {
         Ok(())
     }
 
-    // returns the number of the open segment, you're likely to need it
-    fn ensure_open_segment(&mut self, _changes: usize) -> Result<u64> {
-        unimplemented!()
+    fn segment_full(&self, changes: u32) -> bool {
+        assert!(changes <= MAX_SEGMENT_CHANGES);
+
+        if let Some(osi) = self.open_segment.as_ref() {
+            assert!(osi.changes <= MAX_SEGMENT_CHANGES);
+            if changes > MAX_SEGMENT_CHANGES - osi.changes {
+                return true;
+            }
+
+            if osi.offset >= TARGET_SEGMENT_SIZE {
+                return true;
+            }
+        }
+
+        return false;
     }
 
-    fn write_block(&mut self, _count: usize, _block: &[capnp::Word]) -> Result<()> {
-        unimplemented!()
+    // returns the number of the open segment, you're likely to need it
+    fn ensure_open_segment(&mut self, changes: u32) -> Result<u64> {
+        if self.segment_full(changes) {
+            // try to write EOF, if it takes, end the segment
+            let mut msg_builder = capnp::message::Builder::new_default();
+
+            {
+                let mut block_builder = msg_builder.init_root::<yrola_capnp::log_block::Builder>();
+                block_builder.set_eof(());
+            }
+
+            let msg_words = capnp::serialize::write_message_to_words(&msg_builder);
+            try!(self.write_block(0, &*msg_words));
+
+            let final_state = self.open_segment.take().unwrap();
+            self.segments.get_mut(&final_state.id).unwrap().on_disk_size = final_state.offset;
+        }
+
+        if self.open_segment.is_none() {
+            // open a brand-new segment file
+            if self.highwater_segment_id == u64::MAX {
+                return Err(Error::JournalFull);
+            }
+
+            if self.segments.len() == MAX_SEGMENT_COUNT {
+                return Err(Error::JournalFull);
+            }
+
+            self.highwater_segment_id = self.highwater_segment_id + 1;
+            let new_seg_id = self.highwater_segment_id;
+            let new_seg_path = self.segment_path(new_seg_id);
+            let writeh = try!(wrap_io(&new_seg_path,
+                                      IoType::SegmentCreate,
+                                      File::create(&new_seg_path)));
+
+            self.open_segment = Some(OpenSegmentInfo {
+                id: new_seg_id,
+                handle: writeh,
+                path: new_seg_path,
+                offset: 0,
+                changes: 0,
+                pending_truncate: false,
+            });
+            self.segments.insert(new_seg_id,
+                                 SegmentInfo {
+                                     live_object_ids: HashSet::new(),
+                                     dead_object_ids: HashSet::new(),
+                                     live_tombstone_ids: HashSet::new(),
+                                     on_disk_size: 0,
+                                 });
+        }
+
+        let open_seg_id = self.open_segment.as_ref().unwrap().id;
+        if self.open_segment.as_ref().unwrap().offset == 0 {
+            // log a SegmentHeader before anything else
+            let mut msg_builder = capnp::message::Builder::new_default();
+
+            {
+                let block_builder = msg_builder.init_root::<yrola_capnp::log_block::Builder>();
+                let mut header_builder = block_builder.init_segment_header();
+
+                {
+                    let prev_cnt = (self.segments.len() - 1) as u32;
+                    let mut previd_builder = (&mut header_builder)
+                                                 .borrow()
+                                                 .init_previous_segment_ids(prev_cnt);
+                    let mut prev_ix = 0;
+                    for prev_seg_id in self.segments.keys() {
+                        if *prev_seg_id != open_seg_id {
+                            previd_builder.set(prev_ix, *prev_seg_id);
+                            prev_ix += 1;
+                        }
+                    }
+                }
+
+                header_builder.set_highest_ever_item_id(self.highwater_object_id);
+                self.save_config((&mut header_builder).borrow().init_config());
+            }
+
+            let msg_words = capnp::serialize::write_message_to_words(&msg_builder);
+            try!(self.write_block(0, &*msg_words));
+        }
+
+        Ok(open_seg_id)
+    }
+
+    // call ensure_open_segment first!
+    fn write_block(&mut self, count: u32, block: &[capnp::Word]) -> Result<()> {
+        let mut osinfo = self.open_segment.as_mut().unwrap();
+
+        if osinfo.pending_truncate {
+            // maintain the charade by refusing to commit anything if we think the last commit
+            // failed, until we can convince the storage layer that the commit did fail
+
+            try!(truncate_log(&mut osinfo.handle, &osinfo.path, osinfo.offset));
+            // hey, we have consensus
+            osinfo.pending_truncate = false;
+        }
+
+        match write_log_block(&mut osinfo.handle,
+                              &osinfo.path,
+                              osinfo.id,
+                              &mut osinfo.offset,
+                              block) {
+            Ok(_) => {
+                osinfo.changes += count;
+                Ok(())
+            }
+            e@Err(_) => {
+                // We might or might not have successfully committed.  Try to roll back.
+                // If we crash before the rollback attempt, then the app will never find out
+                // whether succeeded or not and either outcome is consistent.
+                // If we rollback successfully, then we'll effectively never have committed, and
+                // the app will see the commit having cleanly failed.  (This is for ENOSPC).
+                // If the rollback fails, we're in a sticky situation; we need to report something
+                // to the app, but we don't know.  Pretend it failed, and make sure nothing else
+                // is sent to the log until the rollback succeeds.  If the rollback never suceeds
+                // before the next crash, *and* the operation actually took, then we'll be stuck
+                // with a commit that the app thinks failed; some communication of expectations is
+                // required here.
+                match truncate_log(&mut osinfo.handle, &osinfo.path, osinfo.offset) {
+                    Ok(_) => {}
+                    Err(_) => {
+                        // Both the commit and the uncommit failed... mark the log
+                        osinfo.pending_truncate = true;
+                    }
+                }
+                e
+            }
+        }
     }
 
     fn evacuate(&mut self, segment_id: u64) -> Result<()> {
@@ -1021,8 +1197,9 @@ impl Persister {
         let msg_words = capnp::serialize::write_message_to_words(&msg_builder);
 
         let evac_count = seginfo.live_object_ids.len() + seginfo.live_tombstone_ids.len();
-        let write_seg_id = try!(self.ensure_open_segment(evac_count));
-        try!(self.write_block(evac_count, &*msg_words));
+        assert!(evac_count < MAX_SEGMENT_CHANGES as usize);
+        let write_seg_id = try!(self.ensure_open_segment(evac_count as u32));
+        try!(self.write_block(evac_count as u32, &*msg_words));
         // if we get here, the old segment should be considered *not* part of the image
 
         // TODO(someday): repeatedly looking up the current segment is sub-optimal
