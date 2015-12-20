@@ -55,6 +55,9 @@ pub enum IoType {
     CleanupOpendir,
     CleanupReaddir,
     CleanupDelete,
+    ObjectCreate,
+    ObjectWrite,
+    ObjectSync,
     ObjectOpen,
     ObjectRead,
     ObjectDelete,
@@ -362,8 +365,9 @@ impl<'a> Iterator for ItemIterator<'a> {
 
 pub struct Transaction<'a> {
     journal: &'a mut Persister,
-    new_inline: HashMap<u64, ItemHandle>,
+    new_items: HashMap<u64, ItemHandle>,
     del_items: HashSet<u64>,
+    large_objects: Vec<(File, PathBuf, ValueHandle)>,
 }
 
 impl<'a> Transaction<'a> {
@@ -376,22 +380,43 @@ impl<'a> Transaction<'a> {
             return Err(Error::Exhausted(Exhaustion::HeaderSize(header.len(), MAX_HEADER_LEN)));
         }
 
+        self.journal.highwater_object_id += 1;
+        let id = self.journal.highwater_object_id;
+
         if data.len() > MAX_INLINE_LEN {
-            unimplemented!()
+            let path = self.journal.object_path(id);
+            let mut handle = try!(wrap_io(&path, IoType::ObjectCreate, File::create(&path)));
+            let hash = external_hash(id, &*data);
+            try!(wrap_io(&path, IoType::ObjectWrite, handle.write_all(&*data)));
+            let file_struct = Arc::new(FileControl {
+                id: id,
+                size: data.len() as u64,
+                hash: hash,
+                dir_control: self.journal.dir_control.clone(),
+                pending_delete: Mutex::new(true),
+                loaded_data: Mutex::new(Some(Arc::new(data))),
+            });
+            let new_ih = ItemHandle {
+                id: id,
+                header: Arc::new(header),
+                body: ValueHandle::LargeData(file_struct),
+            };
+            self.large_objects.push((handle, path, new_ih.body.clone()));
+            self.new_items.insert(id, new_ih);
+        } else {
+            let new_ih = ItemHandle {
+                id: id,
+                header: Arc::new(header),
+                body: ValueHandle::SmallData(Arc::new(data)),
+            };
+            self.new_items.insert(id, new_ih);
         }
 
-        self.journal.highwater_object_id += 1;
-        let new_ih = ItemHandle {
-            id: self.journal.highwater_object_id,
-            header: Arc::new(header),
-            body: ValueHandle::SmallData(Arc::new(data)),
-        };
-        self.new_inline.insert(self.journal.highwater_object_id, new_ih);
-        Ok(self.journal.highwater_object_id)
+        Ok(id)
     }
 
     pub fn del_item(&mut self, id: u64) -> Result<()> {
-        if self.new_inline.remove(&id).is_some() {
+        if self.new_items.remove(&id).is_some() {
             Ok(())
         } else if self.journal.objects.contains_key(&id) && !self.del_items.contains(&id) {
             self.del_items.insert(id);
@@ -402,7 +427,7 @@ impl<'a> Transaction<'a> {
     }
 
     pub fn get_item(&mut self, id: u64) -> Result<&ItemHandle> {
-        if let Some(ref_ith) = self.new_inline.get(&id) {
+        if let Some(ref_ith) = self.new_items.get(&id) {
             return Ok(ref_ith);
         }
 
@@ -418,7 +443,7 @@ impl<'a> Transaction<'a> {
     pub fn list_items<'b>(&'b mut self) -> ItemIterator<'b> {
         ItemIterator {
             existing_iter: self.journal.objects.values(),
-            new_iter: self.new_inline.values(),
+            new_iter: self.new_items.values(),
             existing_iter_done: false,
             new_iter_done: false,
             deleted: &self.del_items,
@@ -426,7 +451,7 @@ impl<'a> Transaction<'a> {
     }
 
     pub fn commit(self) -> Result<()> {
-        let count = self.new_inline.len() + self.del_items.len();
+        let count = self.new_items.len() + self.del_items.len();
         if count > MAX_SEGMENT_CHANGES as usize {
             let exhtype = Exhaustion::CommitSize(count, MAX_SEGMENT_CHANGES as usize);
             return Err(Error::Exhausted(exhtype));
@@ -440,14 +465,23 @@ impl<'a> Transaction<'a> {
             let block_builder = msg_builder.init_root::<yrola_capnp::log_block::Builder>();
             let mut commit_builder = block_builder.init_commit();
 
-            if !self.new_inline.is_empty() {
+            let mut inline_count = 0;
+            for item in self.new_items.values() {
+                if !item.body.is_external() {
+                    inline_count += 1;
+                }
+            }
+            if inline_count > 0 {
                 // TODO(someday): Without the &mut the borrowck balks. ???
                 let mut inline_builder = (&mut commit_builder)
                                              .borrow()
-                                             .init_new_inline(self.new_inline.len() as u32);
+                                             .init_new_inline(inline_count);
                 let mut inline_ix = 0;
 
-                for (obj_id, item_hdl) in &self.new_inline {
+                for (obj_id, item_hdl) in &self.new_items {
+                    if item_hdl.body.is_external() {
+                        continue;
+                    }
                     let mut nin_builder = (&mut inline_builder).borrow().get(inline_ix);
                     inline_ix += 1;
                     nin_builder.set_id(*obj_id);
@@ -457,6 +491,37 @@ impl<'a> Transaction<'a> {
                             nin_builder.set_data(&*body);
                         }
                         ValueHandle::LargeData(_) => unreachable!(),
+                    }
+                }
+            }
+
+            let mut external_count = 0;
+            for item in self.new_items.values() {
+                if item.body.is_external() {
+                    external_count += 1;
+                }
+            }
+            if external_count > 0 {
+                // TODO(someday): Without the &mut the borrowck balks. ???
+                let mut extern_builder = (&mut commit_builder)
+                                             .borrow()
+                                             .init_new_external(external_count);
+                let mut extern_ix = 0;
+
+                for (obj_id, item_hdl) in &self.new_items {
+                    if !item_hdl.body.is_external() {
+                        continue;
+                    }
+                    let mut nex_builder = (&mut extern_builder).borrow().get(extern_ix);
+                    extern_ix += 1;
+                    nex_builder.set_id(*obj_id);
+                    nex_builder.set_header(&*item_hdl.header);
+                    match item_hdl.body {
+                        ValueHandle::SmallData(_) => unreachable!(),
+                        ValueHandle::LargeData(ref file) => {
+                            nex_builder.set_hash(file.hash);
+                            nex_builder.set_size(file.size);
+                        }
                     }
                 }
             }
@@ -476,10 +541,26 @@ impl<'a> Transaction<'a> {
 
         let msg_words = capnp::serialize::write_message_to_words(&msg_builder);
         let write_seg_id = try!(self.journal.ensure_open_segment(count as u32));
-        try!(self.journal.write_block(count as u32, &*msg_words));
+
+        // make sure the objects are written and not deleted before the segment
+        for &(ref hdl, ref path, ref struc) in &self.large_objects {
+            try!(wrap_io(path, IoType::ObjectSync, hdl.sync_data()));
+            struc.mark_delete(false);
+        }
+
+        match self.journal.write_block(count as u32, &*msg_words) {
+            Ok(_) => {}
+            e@Err(_) => {
+                // whoops, we do want these deleted after all
+                for &(ref _hdl, ref _path, ref struc) in &self.large_objects {
+                    struc.mark_delete(true);
+                }
+                return e;
+            }
+        }
 
         // we wrote it to the journal, now update our data structures
-        for (obj_id, ith) in self.new_inline {
+        for (obj_id, ith) in self.new_items {
             self.journal.objects.insert(obj_id,
                                         ObjectInfo {
                                             segment_id: write_seg_id,
@@ -655,8 +736,9 @@ impl Persister {
     pub fn transaction(&mut self) -> Transaction {
         Transaction {
             journal: self,
-            new_inline: HashMap::new(),
+            new_items: HashMap::new(),
             del_items: HashSet::new(),
+            large_objects: Vec::new(),
         }
     }
 
@@ -735,6 +817,10 @@ impl Persister {
 
     fn segment_path(&self, id: u64) -> PathBuf {
         self.segs_path.join(format!("{:06}", id))
+    }
+
+    fn object_path(&self, id: u64) -> PathBuf {
+        self.objs_path.join(format!("{:06}", id))
     }
 
     fn read_segment(&mut self,
@@ -1305,7 +1391,7 @@ impl Persister {
 
         while !obj_delete_lock.is_empty() {
             let obj_id = obj_delete_lock[obj_delete_lock.len() - 1];
-            let obj_path = self.objs_path.join(format!("{:06}", obj_id));
+            let obj_path = self.object_path(obj_id);
             try!(wrap_io(&obj_path, IoType::ObjectDelete, fs::remove_file(&obj_path)));
             obj_delete_lock.pop();
         }
