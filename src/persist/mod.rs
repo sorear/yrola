@@ -166,7 +166,7 @@ struct JournalConfig {
 // live tombstones it contains; a tombstone is live if a live segment contains
 // a matching dead object.
 
-pub struct Persister {
+pub struct Connection {
     lock_path: PathBuf,
     segs_path: PathBuf,
     objs_path: PathBuf,
@@ -364,7 +364,7 @@ impl<'a> Iterator for ItemIterator<'a> {
 }
 
 pub struct Transaction<'a> {
-    journal: &'a mut Persister,
+    journal: &'a mut Connection,
     new_items: HashMap<u64, ItemHandle>,
     del_items: HashSet<u64>,
     large_objects: Vec<(File, PathBuf, ValueHandle)>,
@@ -732,7 +732,7 @@ fn truncate_log(segment: &mut File, segment_path: &PathBuf, segment_position: u6
     Ok(())
 }
 
-impl Persister {
+impl Connection {
     pub fn transaction(&mut self) -> Transaction {
         Transaction {
             journal: self,
@@ -791,7 +791,7 @@ impl Persister {
             }
         }
 
-        let mut pers = Persister {
+        let mut pers = Connection {
             lock_file: lock_file,
             lock_path: lock_path.clone(),
             objs_path: objs_path.clone(),
@@ -1407,7 +1407,7 @@ impl Persister {
     }
 }
 
-// dropping a Persister guarantees no further *writes*, but any existing ValueHandle can
+// dropping a Connection guarantees no further *writes*, but any existing ValueHandle can
 // cause a read.  We could implement a hard disconnect in the future, but it'd be ugly with mmap.
 
 #[cfg(test)]
