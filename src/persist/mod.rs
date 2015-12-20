@@ -21,7 +21,7 @@ pub enum Error {
     Corrupt(Corruption, PathBuf),
     Io(IoType, PathBuf, io::Error),
     Exhausted(Exhaustion),
-    NoSuchKey(u64),
+    NotFound(u64),
     Disconnected,
 }
 
@@ -313,18 +313,40 @@ impl ItemHandle {
 }
 
 pub struct ItemIterator<'a> {
-    guts: &'a (),
+    new_iter: ::std::collections::hash_map::Values<'a, u64, ItemHandle>,
+    existing_iter: ::std::collections::hash_map::Values<'a, u64, ObjectInfo>,
+    deleted: &'a HashSet<u64>,
+    new_iter_done: bool,
+    existing_iter_done: bool,
 }
+
 impl<'a> Iterator for ItemIterator<'a> {
-    type Item = ItemHandle;
-    fn next(&mut self) -> Option<ItemHandle> {
-        unimplemented!()
+    type Item = &'a ItemHandle;
+    fn next(&mut self) -> Option<&'a ItemHandle> {
+        loop {
+            if !self.new_iter_done {
+                match self.new_iter.next() {
+                    r@Some(_) => return r,
+                    None => self.new_iter_done = true,
+                }
+            }
+
+            if !self.existing_iter_done {
+                match self.existing_iter.next() {
+                    Some(obji) if self.deleted.contains(&obji.data.id) => continue,
+                    Some(obji) => return Some(&obji.data),
+                    None => self.existing_iter_done = true,
+                }
+            }
+
+            return None;
+        }
     }
 }
 
 pub struct Transaction<'a> {
     journal: &'a mut Persister,
-    new_inline: HashMap<u64, (Vec<u8>, Vec<u8>)>,
+    new_inline: HashMap<u64, ItemHandle>,
     del_items: HashSet<u64>,
 }
 
@@ -343,7 +365,12 @@ impl<'a> Transaction<'a> {
         }
 
         self.journal.highwater_object_id += 1;
-        self.new_inline.insert(self.journal.highwater_object_id, (header, data));
+        let new_ih = ItemHandle {
+            id: self.journal.highwater_object_id,
+            header: Arc::new(header),
+            body: ValueHandle::SmallData(Arc::new(data)),
+        };
+        self.new_inline.insert(self.journal.highwater_object_id, new_ih);
         Ok(self.journal.highwater_object_id)
     }
 
@@ -354,16 +381,32 @@ impl<'a> Transaction<'a> {
             self.del_items.insert(id);
             Ok(())
         } else {
-            Err(Error::NoSuchKey(id))
+            Err(Error::NotFound(id))
         }
     }
 
-    pub fn get_item(&mut self, _id: u64) -> Result<ItemHandle> {
-        unimplemented!()
+    pub fn get_item(&mut self, id: u64) -> Result<&ItemHandle> {
+        if let Some(ref_ith) = self.new_inline.get(&id) {
+            return Ok(ref_ith);
+        }
+
+        if let Some(ref_objinfo) = self.journal.objects.get(&id) {
+            if !self.del_items.contains(&id) {
+                return Ok(&ref_objinfo.data);
+            }
+        }
+
+        return Err(Error::NotFound(id));
     }
 
-    pub fn list_items<'b>(&'b mut self) -> Result<ItemIterator<'b>> {
-        unimplemented!()
+    pub fn list_items<'b>(&'b mut self) -> ItemIterator<'b> {
+        ItemIterator {
+            existing_iter: self.journal.objects.values(),
+            new_iter: self.new_inline.values(),
+            existing_iter_done: false,
+            new_iter_done: false,
+            deleted: &self.del_items,
+        }
     }
 
     pub fn commit(self) -> Result<()> {
@@ -386,12 +429,17 @@ impl<'a> Transaction<'a> {
                                              .init_new_inline(self.new_inline.len() as u32);
                 let mut inline_ix = 0;
 
-                for (obj_id, &(ref header, ref body)) in &self.new_inline {
+                for (obj_id, item_hdl) in &self.new_inline {
                     let mut nin_builder = (&mut inline_builder).borrow().get(inline_ix);
                     inline_ix += 1;
                     nin_builder.set_id(*obj_id);
-                    nin_builder.set_header(&*header);
-                    nin_builder.set_data(&*body);
+                    nin_builder.set_header(&*item_hdl.header);
+                    match item_hdl.body {
+                        ValueHandle::SmallData(ref body) => {
+                            nin_builder.set_data(&*body);
+                        }
+                        ValueHandle::LargeData(_) => unreachable!(),
+                    }
                 }
             }
 
@@ -413,15 +461,11 @@ impl<'a> Transaction<'a> {
         try!(self.journal.write_block(count as u32, &*msg_words));
 
         // we wrote it to the journal, now update our data structures
-        for (obj_id, (header, body)) in self.new_inline {
+        for (obj_id, ith) in self.new_inline {
             self.journal.objects.insert(obj_id,
                                         ObjectInfo {
                                             segment_id: write_seg_id,
-                                            data: ItemHandle {
-                                                id: obj_id,
-                                                header: Arc::new(header),
-                                                body: ValueHandle::SmallData(Arc::new(body)),
-                                            },
+                                            data: ith,
                                         });
             self.journal.segments.get_mut(&write_seg_id).unwrap().live_object_ids.insert(obj_id);
         }
@@ -593,8 +637,12 @@ fn truncate_log(segment: &mut File, segment_path: &PathBuf, segment_position: u6
 }
 
 impl Persister {
-    pub fn transaction(&self) -> Transaction {
-        unimplemented!()
+    pub fn transaction(&mut self) -> Transaction {
+        Transaction {
+            journal: self,
+            new_inline: HashMap::new(),
+            del_items: HashSet::new(),
+        }
     }
 
     pub fn open(root: &Path, readonly: bool) -> Result<Self> {
