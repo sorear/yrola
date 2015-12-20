@@ -24,6 +24,8 @@ pub enum Error {
     Disconnected,
     JournalFull,
     NoSuchKey(u64),
+    OversizeHeader(usize, usize),
+    OversizeCommit(usize, usize),
 }
 
 #[derive(Debug)]
@@ -140,8 +142,6 @@ struct JournalConfig {
     app_version: u32,
 }
 
-const MAX_SEGMENT_CHANGES: usize = 1 << 28;
-
 // Naturally we need to track the live objects.  To support evacuation, we need
 // to be able to ask for any segment what live objects it contains and what
 // live tombstones it contains; a tombstone is live if a live segment contains
@@ -172,6 +172,13 @@ pub enum LogBlockError {
     BadHeaderHash,
     BadBodyHash,
 }
+
+const YROLA_SIGNATURE: &'static [u8] = b"Yrola Journal format <0>\n";
+
+const MAX_SEGMENT_CHANGES: usize = 1 << 28;
+const MAX_HEADER_LEN: usize = 1 << 20;
+// TODO(someday): Tuning parameter
+const MAX_INLINE_LEN: usize = 1 << 20;
 
 fn wrap_capnp<S, E>(path: &PathBuf, res: result::Result<S, E>) -> Result<S>
     where capnp::Error: From<E>
@@ -316,7 +323,7 @@ impl<'a> Iterator for ItemIterator<'a> {
 pub struct Transaction<'a> {
     journal: &'a mut Persister,
     highwater_object_id: u64,
-    new_items: HashMap<u64, (Vec<u8>, Vec<u8>)>,
+    new_inline: HashMap<u64, (Vec<u8>, Vec<u8>)>,
     del_items: HashSet<u64>,
 }
 
@@ -325,13 +332,22 @@ impl<'a> Transaction<'a> {
         if self.highwater_object_id == u64::MAX {
             return Err(Error::JournalFull);
         }
+
+        if header.len() > MAX_HEADER_LEN {
+            return Err(Error::OversizeHeader(header.len(), MAX_HEADER_LEN));
+        }
+
+        if data.len() > MAX_INLINE_LEN {
+            unimplemented!()
+        }
+
         self.highwater_object_id += 1;
-        self.new_items.insert(self.highwater_object_id, (header, data));
+        self.new_inline.insert(self.highwater_object_id, (header, data));
         Ok(self.highwater_object_id)
     }
 
     pub fn del_item(&mut self, id: u64) -> Result<()> {
-        if self.new_items.remove(&id).is_some() {
+        if self.new_inline.remove(&id).is_some() {
             Ok(())
         } else if self.journal.objects.contains_key(&id) && !self.del_items.contains(&id) {
             self.del_items.insert(id);
@@ -350,7 +366,103 @@ impl<'a> Transaction<'a> {
     }
 
     pub fn commit(self) -> Result<()> {
-        unimplemented!()
+        let count = self.new_inline.len() + self.del_items.len();
+        if count > MAX_SEGMENT_CHANGES {
+            return Err(Error::OversizeCommit(count, MAX_SEGMENT_CHANGES));
+        }
+
+        let mut msg_builder = capnp::message::Builder::new_default();
+
+        {
+            let block_builder = msg_builder.init_root::<yrola_capnp::log_block::Builder>();
+            let mut commit_builder = block_builder.init_commit();
+
+            if !self.new_inline.is_empty() {
+                // TODO(someday): Without the &mut the borrowck balks. ???
+                let mut inline_builder = (&mut commit_builder)
+                                             .borrow()
+                                             .init_new_inline(self.new_inline.len() as u32);
+                let mut inline_ix = 0;
+
+                for (obj_id, &(ref header, ref body)) in &self.new_inline {
+                    let mut nin_builder = (&mut inline_builder).borrow().get(inline_ix);
+                    inline_ix += 1;
+                    nin_builder.set_id(*obj_id);
+                    nin_builder.set_header(&*header);
+                    nin_builder.set_data(&*body);
+                }
+            }
+
+            if !self.del_items.is_empty() {
+                let mut ts_builder = (&mut commit_builder)
+                                         .borrow()
+                                         .init_deleted(self.del_items.len() as u32);
+                let mut ts_ix = 0;
+
+                for ts_id in &self.del_items {
+                    ts_builder.set(ts_ix, *ts_id);
+                    ts_ix += 1;
+                }
+            }
+        }
+
+        let msg_words = capnp::serialize::write_message_to_words(&msg_builder);
+        let write_seg_id = try!(self.journal.ensure_open_segment(count));
+        try!(self.journal.write_block(count, &*msg_words));
+
+        // we wrote it to the journal, now update our data structures
+        for (obj_id, (header, body)) in self.new_inline {
+            self.journal.objects.insert(obj_id,
+                                        ObjectInfo {
+                                            journal_id: write_seg_id,
+                                            data: ItemHandle {
+                                                id: obj_id,
+                                                header: Arc::new(header),
+                                                body: ValueHandle::SmallData(Arc::new(body)),
+                                            },
+                                        });
+            self.journal.segments.get_mut(&write_seg_id).unwrap().live_object_ids.insert(obj_id);
+        }
+
+        for ts_id in self.del_items {
+            let obj_info = self.journal.objects.remove(&ts_id).unwrap();
+
+            if obj_info.journal_id == write_seg_id {
+                // killing an object in the same segment it was written does not create a live
+                // tombstone (it does need to be written, though)
+                {
+                    let mut obj_seg = self.journal.segments.get_mut(&obj_info.journal_id).unwrap();
+                    obj_seg.live_object_ids.remove(&ts_id);
+                }
+            } else {
+                // we need to track this tombstone if the segment is evacuated later, and track the
+                // object so that the tombstone can be removed when the object is purged
+                {
+                    let mut obj_seg = self.journal.segments.get_mut(&obj_info.journal_id).unwrap();
+                    obj_seg.live_object_ids.remove(&ts_id);
+                    obj_seg.dead_object_ids.insert(ts_id);
+                }
+                self.journal.tombstones.insert(ts_id, TombstoneInfo { journal_id: write_seg_id });
+                self.journal
+                    .segments
+                    .get_mut(&write_seg_id)
+                    .unwrap()
+                    .live_tombstone_ids
+                    .insert(ts_id);
+            }
+
+            match obj_info.data.body {
+                ValueHandle::SmallData(_) => {}
+                ValueHandle::LargeData(ref file) => {
+                    // this is not allowed to fail the commit
+                    self.journal.delete_object_soon(file.clone());
+                }
+            }
+        }
+
+        self.journal.highwater_object_id = self.highwater_object_id;
+
+        Ok(())
     }
 }
 
@@ -485,14 +597,6 @@ struct JournalReadResult {
     end_pos: u64,
     saw_eof: bool,
 }
-
-impl OpenSegmentInfo {
-    fn write_block(&mut self, _count: usize, _block: &[capnp::Word]) -> Result<()> {
-        unimplemented!()
-    }
-}
-
-const YROLA_SIGNATURE: &'static [u8] = b"Yrola Journal format <0>\n";
 
 impl Persister {
     pub fn transaction(&self) -> Transaction {
@@ -845,7 +949,12 @@ impl Persister {
         Ok(())
     }
 
-    fn ensure_open_segment(&mut self, _changes: usize) -> Result<()> {
+    // returns the number of the open segment, you're likely to need it
+    fn ensure_open_segment(&mut self, _changes: usize) -> Result<u64> {
+        unimplemented!()
+    }
+
+    fn write_block(&mut self, _count: usize, _block: &[capnp::Word]) -> Result<()> {
         unimplemented!()
     }
 
@@ -860,9 +969,6 @@ impl Persister {
             }
         }
         let inl_count = seginfo.live_object_ids.len() - ext_count;
-
-        let evac_count = seginfo.live_object_ids.len() + seginfo.live_tombstone_ids.len();
-        try!(self.ensure_open_segment(evac_count));
 
         let mut msg_builder = capnp::message::Builder::new_default();
 
@@ -934,10 +1040,13 @@ impl Persister {
         }
 
         let msg_words = capnp::serialize::write_message_to_words(&msg_builder);
-        let write_seg_id = self.open_segment.as_ref().unwrap().id;
-        try!(self.open_segment.as_mut().unwrap().write_block(evac_count, &*msg_words));
+
+        let evac_count = seginfo.live_object_ids.len() + seginfo.live_tombstone_ids.len();
+        let write_seg_id = try!(self.ensure_open_segment(evac_count));
+        try!(self.write_block(evac_count, &*msg_words));
         // if we get here, the old segment should be considered *not* part of the image
 
+        // TODO(someday): repeatedly looking up the current segment is sub-optimal
         for moved_obj_id in &seginfo.live_object_ids {
             self.objects.get_mut(moved_obj_id).unwrap().journal_id = write_seg_id;
             self.segments.get_mut(&write_seg_id).unwrap().live_object_ids.insert(*moved_obj_id);
@@ -962,6 +1071,10 @@ impl Persister {
 
         self.segments.remove(&segment_id);
         Ok(())
+    }
+
+    fn delete_object_soon(&mut self, _file: Arc<FileControl>) {
+        unimplemented!()
     }
 }
 
