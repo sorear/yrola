@@ -20,11 +20,18 @@ use yrola_capnp;
 pub enum Error {
     Corrupt(Corruption, PathBuf),
     Io(IoType, PathBuf, io::Error),
-    Disconnected,
-    JournalFull,
+    Exhausted(Exhaustion),
     NoSuchKey(u64),
-    OversizeHeader(usize, usize),
-    OversizeCommit(usize, usize),
+    Disconnected,
+}
+
+#[derive(Debug)]
+pub enum Exhaustion {
+    SegmentId,
+    ObjectId,
+    SegmentCount,
+    CommitSize(usize, usize),
+    HeaderSize(usize, usize),
 }
 
 #[derive(Debug)]
@@ -317,28 +324,27 @@ impl<'a> Iterator for ItemIterator<'a> {
 
 pub struct Transaction<'a> {
     journal: &'a mut Persister,
-    highwater_object_id: u64,
     new_inline: HashMap<u64, (Vec<u8>, Vec<u8>)>,
     del_items: HashSet<u64>,
 }
 
 impl<'a> Transaction<'a> {
     pub fn add_item(&mut self, header: Vec<u8>, data: Vec<u8>) -> Result<u64> {
-        if self.highwater_object_id == u64::MAX {
-            return Err(Error::JournalFull);
+        if self.journal.highwater_object_id == u64::MAX {
+            return Err(Error::Exhausted(Exhaustion::ObjectId));
         }
 
         if header.len() > MAX_HEADER_LEN {
-            return Err(Error::OversizeHeader(header.len(), MAX_HEADER_LEN));
+            return Err(Error::Exhausted(Exhaustion::HeaderSize(header.len(), MAX_HEADER_LEN)));
         }
 
         if data.len() > MAX_INLINE_LEN {
             unimplemented!()
         }
 
-        self.highwater_object_id += 1;
-        self.new_inline.insert(self.highwater_object_id, (header, data));
-        Ok(self.highwater_object_id)
+        self.journal.highwater_object_id += 1;
+        self.new_inline.insert(self.journal.highwater_object_id, (header, data));
+        Ok(self.journal.highwater_object_id)
     }
 
     pub fn del_item(&mut self, id: u64) -> Result<()> {
@@ -363,7 +369,8 @@ impl<'a> Transaction<'a> {
     pub fn commit(self) -> Result<()> {
         let count = self.new_inline.len() + self.del_items.len();
         if count > MAX_SEGMENT_CHANGES as usize {
-            return Err(Error::OversizeCommit(count, MAX_SEGMENT_CHANGES as usize));
+            let exhtype = Exhaustion::CommitSize(count, MAX_SEGMENT_CHANGES as usize);
+            return Err(Error::Exhausted(exhtype));
         }
 
         let mut msg_builder = capnp::message::Builder::new_default();
@@ -454,8 +461,6 @@ impl<'a> Transaction<'a> {
                 }
             }
         }
-
-        self.journal.highwater_object_id = self.highwater_object_id;
 
         Ok(())
     }
@@ -1002,11 +1007,11 @@ impl Persister {
         if self.open_segment.is_none() {
             // open a brand-new segment file
             if self.highwater_segment_id == u64::MAX {
-                return Err(Error::JournalFull);
+                return Err(Error::Exhausted(Exhaustion::SegmentId));
             }
 
-            if self.segments.len() == MAX_SEGMENT_COUNT {
-                return Err(Error::JournalFull);
+            if self.segments.len() >= MAX_SEGMENT_COUNT {
+                return Err(Error::Exhausted(Exhaustion::SegmentCount));
             }
 
             self.highwater_segment_id = self.highwater_segment_id + 1;
