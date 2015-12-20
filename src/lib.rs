@@ -3,8 +3,8 @@ extern crate fs2;
 extern crate capnp;
 extern crate byteorder;
 
-mod persist;
-mod table_mgr;
+pub mod persist;
+pub mod table_mgr;
 mod borrow_segments;
 
 mod yrola_capnp {

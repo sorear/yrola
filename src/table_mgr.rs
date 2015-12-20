@@ -20,6 +20,31 @@ struct LevelReader {
     bundle_index: Option<u32>,
 }
 
+#[derive(Clone)]
+enum LevelOrSavepoint {
+    Level(LevelHandle),
+    Savepoint(String),
+}
+
+struct Transaction {
+    start_stamp: u64,
+    committed: Vec<LevelHandle>,
+    uncomitted: Vec<LevelOrSavepoint>,
+}
+
+#[derive(Default)]
+pub struct TableCreateOptions {
+    key_count: u32,
+}
+
+pub struct TableMetadata {
+    exists: bool,
+}
+
+pub enum Error {}
+
+pub type Result<T> = result::Result<T, Error>;
+
 impl LevelHandle {
     fn get_level_reader(&self) -> Result<LevelReader> {
         let pin = try!(self.value.pin());
@@ -83,29 +108,6 @@ impl LevelReader {
     }
 }
 
-#[derive(Clone)]
-enum LevelOrSavepoint {
-    Level(LevelHandle),
-    Savepoint(String),
-}
-
-struct Transaction {
-    start_stamp: u64,
-    committed: Vec<LevelHandle>,
-    uncomitted: Vec<LevelOrSavepoint>,
-}
-
-#[derive(Default)]
-pub struct TableCreateOptions {
-    key_count: u32,
-}
-
-pub struct TableMetadata {
-    exists: bool,
-}
-
-pub enum Error {}
-
 impl From<capnp::Error> for Error {
     fn from(_err: capnp::Error) -> Error {
         unimplemented!()
@@ -117,8 +119,6 @@ impl From<persist::Error> for Error {
         unimplemented!()
     }
 }
-
-pub type Result<T> = result::Result<T, Error>;
 
 impl Transaction {
     fn get_changelog(&self) -> Vec<&LevelHandle> {

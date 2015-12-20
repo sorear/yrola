@@ -109,10 +109,13 @@ struct FileControl {
 }
 
 #[derive(Clone)]
-pub enum ValueHandle {
-    SmallData(Arc<Vec<u8>>),
-    LargeData(Arc<FileControl>),
+enum ValueImp {
+    Small(Arc<Vec<u8>>),
+    Large(Arc<FileControl>),
 }
+
+#[derive(Clone)]
+pub struct ValueHandle(ValueImp);
 
 #[derive(Clone)]
 pub struct ValuePin {
@@ -264,7 +267,7 @@ impl Drop for FileControl {
 
 impl ValueHandle {
     pub fn new(data: &[u8]) -> ValueHandle {
-        ValueHandle::SmallData(Arc::new(Vec::from(data)))
+        ValueHandle(ValueImp::Small(Arc::new(Vec::from(data))))
     }
 
     pub fn new_words(data: &[capnp::Word]) -> ValueHandle {
@@ -272,16 +275,16 @@ impl ValueHandle {
     }
 
     fn is_external(&self) -> bool {
-        match *self {
-            ValueHandle::SmallData(_) => false,
-            ValueHandle::LargeData(_) => true,
+        match self.0 {
+            ValueImp::Small(_) => false,
+            ValueImp::Large(_) => true,
         }
     }
 
     fn mark_delete(&self, should_delete: bool) {
-        match *self {
-            ValueHandle::SmallData(_) => {}
-            ValueHandle::LargeData(ref file) => {
+        match self.0 {
+            ValueImp::Small(_) => {}
+            ValueImp::Large(ref file) => {
                 let mut lock = file.pending_delete.lock().unwrap();
                 *lock = should_delete;
             }
@@ -297,14 +300,14 @@ impl ValueHandle {
             loaded_data: Mutex::new(None),
             pending_delete: Mutex::new(false),
         });
-        ValueHandle::LargeData(fc)
+        ValueHandle(ValueImp::Large(fc))
     }
 
     // will be retooled when adding mmap support ...
     pub fn pin(&self) -> Result<ValuePin> {
-        match *self {
-            ValueHandle::SmallData(ref rc) => Ok(ValuePin { data: rc.clone() }),
-            ValueHandle::LargeData(ref fl) => {
+        match self.0 {
+            ValueImp::Small(ref rc) => Ok(ValuePin { data: rc.clone() }),
+            ValueImp::Large(ref fl) => {
                 let mut data_lock = fl.loaded_data.lock().unwrap();
                 if let Some(ref data) = *data_lock {
                     return Ok(ValuePin { data: data.clone() });
@@ -349,11 +352,11 @@ impl ItemHandle {
 
     fn live_size(&self) -> u64 {
         let header = (self.header.len() as u64 + 7) & !7;
-        match self.body {
-            ValueHandle::SmallData(ref data) => {
+        match self.body.0 {
+            ValueImp::Small(ref data) => {
                 INLINE_OBJ_SIZE + header + ((data.len() as u64 + 7) & !7)
             }
-            ValueHandle::LargeData(_) => EXTERNAL_OBJ_SIZE + header,
+            ValueImp::Large(_) => EXTERNAL_OBJ_SIZE + header,
         }
     }
 }
@@ -426,7 +429,7 @@ impl<'a> Transaction<'a> {
             let new_ih = ItemHandle {
                 id: id,
                 header: Arc::new(header),
-                body: ValueHandle::LargeData(file_struct),
+                body: ValueHandle(ValueImp::Large(file_struct)),
             };
             self.large_objects.push((handle, path, new_ih.body.clone()));
             self.new_items.insert(id, new_ih);
@@ -434,7 +437,7 @@ impl<'a> Transaction<'a> {
             let new_ih = ItemHandle {
                 id: id,
                 header: Arc::new(header),
-                body: ValueHandle::SmallData(Arc::new(data)),
+                body: ValueHandle(ValueImp::Small(Arc::new(data))),
             };
             self.new_items.insert(id, new_ih);
         }
@@ -514,11 +517,11 @@ impl<'a> Transaction<'a> {
                     inline_ix += 1;
                     nin_builder.set_id(*obj_id);
                     nin_builder.set_header(&*item_hdl.header);
-                    match item_hdl.body {
-                        ValueHandle::SmallData(ref body) => {
+                    match item_hdl.body.0 {
+                        ValueImp::Small(ref body) => {
                             nin_builder.set_data(&*body);
                         }
-                        ValueHandle::LargeData(_) => unreachable!(),
+                        ValueImp::Large(_) => unreachable!(),
                     }
                 }
             }
@@ -544,9 +547,9 @@ impl<'a> Transaction<'a> {
                     extern_ix += 1;
                     nex_builder.set_id(*obj_id);
                     nex_builder.set_header(&*item_hdl.header);
-                    match item_hdl.body {
-                        ValueHandle::SmallData(_) => unreachable!(),
-                        ValueHandle::LargeData(ref file) => {
+                    match item_hdl.body.0 {
+                        ValueImp::Small(_) => unreachable!(),
+                        ValueImp::Large(ref file) => {
                             nex_builder.set_hash(file.hash);
                             nex_builder.set_size(file.size);
                         }
@@ -1393,15 +1396,15 @@ impl Connection {
 
                 for obj_id in &seginfo.live_object_ids {
                     let obj_data = &self.objects.get(obj_id).unwrap().data;
-                    match obj_data.body {
-                        ValueHandle::SmallData(ref data) => {
+                    match obj_data.body.0 {
+                        ValueImp::Small(ref data) => {
                             let mut nin_builder = (&mut inline_builder).borrow().get(inline_ix);
                             inline_ix += 1;
                             nin_builder.set_id(obj_data.id);
                             nin_builder.set_header(&*obj_data.header);
                             nin_builder.set_data(&*data);
                         }
-                        ValueHandle::LargeData(_) => {}
+                        ValueImp::Large(_) => {}
                     }
                 }
             }
@@ -1414,9 +1417,9 @@ impl Connection {
 
                 for obj_id in &seginfo.live_object_ids {
                     let obj_data = &self.objects.get(obj_id).unwrap().data;
-                    match obj_data.body {
-                        ValueHandle::SmallData(_) => {}
-                        ValueHandle::LargeData(ref fc) => {
+                    match obj_data.body.0 {
+                        ValueImp::Small(_) => {}
+                        ValueImp::Large(ref fc) => {
                             let mut nex_builder = (&mut extern_builder).borrow().get(extern_ix);
                             extern_ix += 1;
                             nex_builder.set_id(obj_data.id);
