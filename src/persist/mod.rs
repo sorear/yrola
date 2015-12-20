@@ -16,6 +16,11 @@ use std::u32;
 use std::u64;
 use yrola_capnp;
 
+macro_rules! trace {
+    // ( $( $any:tt )* ) => ( println!( $( $any )* ) )
+    ( $( $any:tt )* ) => ( )
+}
+
 #[derive(Debug)]
 pub enum Error {
     Corrupt(Corruption, PathBuf),
@@ -157,7 +162,7 @@ struct OpenSegmentInfo {
     pending_truncate: bool,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Default, Debug)]
 struct JournalConfig {
     app_name: String,
     app_version: u32,
@@ -692,6 +697,7 @@ fn read_log_blocks_file(mut segment: File,
         let hash = LittleEndian::read_u64(&jdata[(read_ptr + 8)..(read_ptr + 16)]);
         let lhash = (leader >> 32) as u32;
         let block_len = leader as u32;
+        trace!("header {:?} {:X} {:X}", read_ptr, leader, hash);
 
         if (block_len & 7) != 0 {
             break_code = LogBlockError::BadHeaderType;
@@ -703,19 +709,19 @@ fn read_log_blocks_file(mut segment: File,
             break;
         }
 
-        read_ptr += 16;
-
-        if jdata.len() - read_ptr < (block_len as usize) {
+        if jdata.len() - (read_ptr + 16) < (block_len as usize) {
             break_code = LogBlockError::IncompleteBody;
             break;
         }
 
-        let block_slice = &jdata[read_ptr..(read_ptr + (block_len as usize))];
+        let block_slice = &jdata[(read_ptr + 16)..(read_ptr + 16 + (block_len as usize))];
 
-        if log_block_hash(segment_id, read_ptr as u64 - 16, block_slice) != hash {
+        if log_block_hash(segment_id, read_ptr as u64, block_slice) != hash {
             break_code = LogBlockError::BadBodyHash;
             break;
         }
+
+        read_ptr += 16 + block_len as usize;
 
         blocks.push(Vec::from(capnp::Word::bytes_to_words(block_slice)));
     }
@@ -789,6 +795,7 @@ impl Connection {
             }
             Err(err) => {
                 if err.kind() == ErrorKind::NotFound && !readonly {
+                    trace!("creating {:?}", root_path);
                     try!(wrap_io(&root_path, IoType::CreateBase, fs::create_dir_all(root)));
                     try!(wrap_io(&segs_path,
                                  IoType::CreateLogDir,
@@ -811,8 +818,9 @@ impl Connection {
 
         let mut lock_file = try!(wrap_io(&lock_path,
                                          IoType::LockOpen,
-                                         OpenOptions::new().write(true).open(&lock_path)));
+                                         OpenOptions::new().write(true).read(true).open(&lock_path)));
         try!(wrap_io(&lock_path, IoType::Lock, lock_file.lock_exclusive()));
+        trace!("open {:?}", root_path);
         {
             let mut content = Vec::new();
             try!(wrap_io(&lock_path,
@@ -842,8 +850,10 @@ impl Connection {
             on_disk_size: 0,
         };
 
+        trace!("reading segments {:?}", root_path);
         try!(pers.read_all_segments());
         if !readonly {
+            trace!("cleaning {:?}", root_path);
             try!(pers.clean_directories());
         }
 
@@ -869,6 +879,7 @@ impl Connection {
         let (end_code, end_pos, jblocks) = try!(read_log_blocks_file(jfile, &jpath, segment_id));
 
         assert!(!self.segments.contains_key(&segment_id));
+        trace!("load segment {:?} {:?} {:?} {:?}", segment_id, end_code, end_pos, jblocks.len());
         self.segments.insert(segment_id,
                              SegmentInfo {
                                  live_object_ids: HashSet::new(),
@@ -998,6 +1009,7 @@ impl Connection {
                        -> Result<()> {
         self.config.app_name = try!(wrap_capnp(filename, reader.get_app_name())).to_owned();
         self.config.app_version = reader.get_app_version();
+        trace!("load config {:?}", self.config);
         Ok(())
     }
 
@@ -1008,6 +1020,7 @@ impl Connection {
 
     fn load_object(&mut self, segment_id: u64, objh: ItemHandle) -> Result<()> {
         let object_id = objh.id();
+        trace!("load object {:?} {:?}", segment_id, object_id);
         self.highwater_object_id = cmp::max(self.highwater_object_id, object_id);
         if let Some(old) = self.objects.get(&object_id) {
             return Err(Error::Corrupt(Corruption::DupObject {
@@ -1032,6 +1045,7 @@ impl Connection {
     }
 
     fn load_tombstone(&mut self, segment_id: u64, object_id: u64) -> Result<()> {
+        trace!("load tombstone {:?} {:?}", segment_id, object_id);
         if let Some(old) = self.tombstones.get(&object_id) {
             return Err(Error::Corrupt(Corruption::DupTombstone {
                                           id: object_id,
@@ -1145,10 +1159,11 @@ impl Connection {
                 if self.segments.contains_key(&jnum) {
                     continue;
                 }
-                try!(wrap_io(&entry.path(),
-                             IoType::CleanupDelete,
-                             fs::remove_file(entry.path())));
             }
+            trace!("clean: delete {:?}", &entry.path());
+            try!(wrap_io(&entry.path(),
+            IoType::CleanupDelete,
+            fs::remove_file(entry.path())));
         }
 
         let objs_iter = try!(wrap_io(&self.objs_path,
@@ -1160,10 +1175,11 @@ impl Connection {
                 if self.objects.contains_key(&jnum) {
                     continue;
                 }
+            }
+                trace!("clean: delete {:?}", &entry.path());
                 try!(wrap_io(&entry.path(),
                              IoType::CleanupDelete,
                              fs::remove_file(entry.path())));
-            }
         }
 
         Ok(())
