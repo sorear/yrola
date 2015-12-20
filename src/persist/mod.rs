@@ -1,21 +1,20 @@
+use byteorder::{LittleEndian, ByteOrder};
+use capnp;
+use fs2::FileExt;
+use std::borrow::Borrow;
+use std::cmp;
+use std::collections::{HashSet, HashMap};
+use std::ffi::OsStr;
 use std::fs::{self, File, OpenOptions};
-use std::path::{Path, PathBuf};
+use std::hash::{SipHasher, Hasher};
 use std::io::{self, ErrorKind, Read, Write, SeekFrom, Seek};
+use std::path::{Path, PathBuf};
 use std::result;
 use std::str::FromStr;
-use std::collections::{HashSet, HashMap};
-use fs2::FileExt;
 use std::sync::{Arc, Mutex, RwLock};
-use std::slice;
-use std::ffi::OsStr;
-use capnp;
-use byteorder::{LittleEndian, ByteOrder};
-use std::hash::{SipHasher, Hasher};
 use std::u32;
 use std::u64;
 use yrola_capnp;
-use std::cmp;
-use std::borrow::Borrow;
 
 #[derive(Debug)]
 pub enum Error {
@@ -37,13 +36,13 @@ pub enum IoType {
     CreateLockFile,
     LockOpen,
     Lock,
-    JournalOpendir,
-    JournalReaddir,
-    JournalOpen,
-    JournalStat,
-    JournalRead,
-    JournalWrite,
-    JournalSync,
+    SegmentOpendir,
+    SegmentReaddir,
+    SegmentOpen,
+    SegmentStat,
+    SegmentRead,
+    SegmentWrite,
+    SegmentSync,
     CleanupOpendir,
     CleanupReaddir,
     CleanupDelete,
@@ -66,7 +65,7 @@ pub enum Corruption {
         id: u64,
         other_file: PathBuf,
     },
-    UnclosedJournal {
+    UnclosedSegment {
         read_error: LogBlockError,
         read_pos: u64,
     },
@@ -108,12 +107,12 @@ pub struct ItemHandle {
 }
 
 struct ObjectInfo {
-    journal_id: u64,
+    segment_id: u64,
     data: ItemHandle,
 }
 
 struct TombstoneInfo {
-    journal_id: u64,
+    segment_id: u64,
 }
 
 #[derive(Clone)]
@@ -149,7 +148,7 @@ struct JournalConfig {
 
 pub struct Persister {
     lock_path: PathBuf,
-    wals_path: PathBuf,
+    segs_path: PathBuf,
     objs_path: PathBuf,
 
     lock_file: File,
@@ -202,20 +201,6 @@ fn parse_object_filename(filename: &OsStr) -> Option<u64> {
     })
 }
 
-fn word_to_byte_slice(sl: &[capnp::Word]) -> &[u8] {
-    unsafe { slice::from_raw_parts(sl.as_ptr() as *const u8, sl.len() << 3) }
-}
-
-// only use this if you have probable cause to assume it's aligned
-// most allocators will 64-bit-align all memory
-fn byte_to_word_slice(byteslice: &[u8]) -> &[capnp::Word] {
-    unsafe {
-        assert!(((byteslice.as_ptr() as usize) & 7) == 0);
-        slice::from_raw_parts(byteslice.as_ptr() as *const capnp::Word,
-                              byteslice.len() >> 3)
-    }
-}
-
 impl ObjDirControl {
     fn new(path: &PathBuf) -> Self {
         ObjDirControl {
@@ -236,7 +221,7 @@ impl ValueHandle {
     }
 
     pub fn new_words(data: &[capnp::Word]) -> ValueHandle {
-        ValueHandle::new(word_to_byte_slice(data))
+        ValueHandle::new(capnp::Word::words_to_bytes(data))
     }
 
     fn is_external(&self) -> bool {
@@ -292,7 +277,7 @@ impl ValuePin {
 
 impl Borrow<[capnp::Word]> for ValuePin {
     fn borrow(&self) -> &[capnp::Word] {
-        byte_to_word_slice(self.data())
+        capnp::Word::bytes_to_words(self.data())
     }
 }
 
@@ -414,7 +399,7 @@ impl<'a> Transaction<'a> {
         for (obj_id, (header, body)) in self.new_inline {
             self.journal.objects.insert(obj_id,
                                         ObjectInfo {
-                                            journal_id: write_seg_id,
+                                            segment_id: write_seg_id,
                                             data: ItemHandle {
                                                 id: obj_id,
                                                 header: Arc::new(header),
@@ -427,22 +412,22 @@ impl<'a> Transaction<'a> {
         for ts_id in self.del_items {
             let obj_info = self.journal.objects.remove(&ts_id).unwrap();
 
-            if obj_info.journal_id == write_seg_id {
+            if obj_info.segment_id == write_seg_id {
                 // killing an object in the same segment it was written does not create a live
                 // tombstone (it does need to be written, though)
                 {
-                    let mut obj_seg = self.journal.segments.get_mut(&obj_info.journal_id).unwrap();
+                    let mut obj_seg = self.journal.segments.get_mut(&obj_info.segment_id).unwrap();
                     obj_seg.live_object_ids.remove(&ts_id);
                 }
             } else {
                 // we need to track this tombstone if the segment is evacuated later, and track the
                 // object so that the tombstone can be removed when the object is purged
                 {
-                    let mut obj_seg = self.journal.segments.get_mut(&obj_info.journal_id).unwrap();
+                    let mut obj_seg = self.journal.segments.get_mut(&obj_info.segment_id).unwrap();
                     obj_seg.live_object_ids.remove(&ts_id);
                     obj_seg.dead_object_ids.insert(ts_id);
                 }
-                self.journal.tombstones.insert(ts_id, TombstoneInfo { journal_id: write_seg_id });
+                self.journal.tombstones.insert(ts_id, TombstoneInfo { segment_id: write_seg_id });
                 self.journal
                     .segments
                     .get_mut(&write_seg_id)
@@ -474,10 +459,10 @@ const LEADER_K1: u64 = 0x520c5e4629fdf1b0;
 const EXTERNAL_K0: u64 = 0xae880699c0628ab8;
 const EXTERNAL_K1: u64 = 0x3f9c216ed189d0f3;
 
-fn leader_hash(journal_id: u64, journal_offset: u64, leader: u32) -> u32 {
+fn leader_hash(segment_id: u64, segment_offset: u64, leader: u32) -> u32 {
     let mut hasher = SipHasher::new_with_keys(LEADER_K0, LEADER_K1);
-    hasher.write_u64(journal_id);
-    hasher.write_u64(journal_offset);
+    hasher.write_u64(segment_id);
+    hasher.write_u64(segment_offset);
     hasher.write_u32(leader);
     hasher.finish() as u32
 }
@@ -489,22 +474,22 @@ fn external_hash(file_id: u64, data: &[u8]) -> u64 {
     hasher.finish()
 }
 
-fn log_block_hash(journal_id: u64, journal_position: u64, data: &[u8]) -> u64 {
+fn log_block_hash(segment_id: u64, segment_position: u64, data: &[u8]) -> u64 {
     let mut hasher = SipHasher::new_with_keys(BLOCK_K0, BLOCK_K1);
-    hasher.write_u64(journal_id);
-    hasher.write_u64(journal_position);
+    hasher.write_u64(segment_id);
+    hasher.write_u64(segment_position);
     hasher.write(data);
     hasher.finish()
 }
 
-fn read_log_blocks_file(mut journal: File,
-                        journal_path: &PathBuf,
-                        journal_id: u64)
+fn read_log_blocks_file(mut segment: File,
+                        segment_path: &PathBuf,
+                        segment_id: u64)
                         -> Result<(LogBlockError, u64, Vec<Vec<capnp::Word>>)> {
     let mut jdata = Vec::new();
-    try!(wrap_io(&journal_path,
-                 IoType::JournalRead,
-                 journal.read_to_end(&mut jdata)));
+    try!(wrap_io(&segment_path,
+                 IoType::SegmentRead,
+                 segment.read_to_end(&mut jdata)));
 
     let mut read_ptr = 0;
     let mut blocks = Vec::new();
@@ -525,7 +510,7 @@ fn read_log_blocks_file(mut journal: File,
             break;
         }
 
-        if leader_hash(journal_id, read_ptr as u64, block_len) != lhash {
+        if leader_hash(segment_id, read_ptr as u64, block_len) != lhash {
             break_code = LogBlockError::BadHeaderHash;
             break;
         }
@@ -539,63 +524,57 @@ fn read_log_blocks_file(mut journal: File,
 
         let block_slice = &jdata[read_ptr..(read_ptr + (block_len as usize))];
 
-        if log_block_hash(journal_id, read_ptr as u64 - 16, block_slice) != hash {
+        if log_block_hash(segment_id, read_ptr as u64 - 16, block_slice) != hash {
             break_code = LogBlockError::BadBodyHash;
             break;
         }
 
-        blocks.push(Vec::from(byte_to_word_slice(block_slice)));
+        blocks.push(Vec::from(capnp::Word::bytes_to_words(block_slice)));
     }
 
     Ok((break_code, read_ptr as u64, blocks))
 }
 
-fn write_log_block(journal: &mut File,
-                   journal_path: &PathBuf,
-                   journal_id: u64,
-                   journal_position: &mut u64,
+fn write_log_block(segment: &mut File,
+                   segment_path: &PathBuf,
+                   segment_id: u64,
+                   segment_position: &mut u64,
                    block: &[capnp::Word])
                    -> Result<()> {
-    let byte_block = word_to_byte_slice(block);
+    let byte_block = capnp::Word::words_to_bytes(block);
     assert!(byte_block.len() <= u32::MAX as usize);
-    let block_hash = log_block_hash(journal_id, *journal_position, byte_block);
+    let block_hash = log_block_hash(segment_id, *segment_position, byte_block);
     let leader = byte_block.len() as u64 |
-                 ((leader_hash(journal_id, *journal_position, byte_block.len() as u32) as u64) <<
+                 ((leader_hash(segment_id, *segment_position, byte_block.len() as u32) as u64) <<
                   32);
 
     let mut header = [0u8; 16];
     LittleEndian::write_u64(&mut header[0..8], leader);
     LittleEndian::write_u64(&mut header[8..16], block_hash);
-    try!(wrap_io(journal_path,
-                 IoType::JournalWrite,
-                 journal.seek(SeekFrom::Start(*journal_position))));
-    try!(wrap_io(journal_path,
-                 IoType::JournalWrite,
-                 journal.write_all(&header)));
-    try!(wrap_io(journal_path,
-                 IoType::JournalWrite,
-                 journal.write_all(byte_block)));
-    try!(wrap_io(journal_path, IoType::JournalSync, journal.sync_data()));
-    *journal_position += 16 + byte_block.len() as u64;
+    try!(wrap_io(segment_path,
+                 IoType::SegmentWrite,
+                 segment.seek(SeekFrom::Start(*segment_position))));
+    try!(wrap_io(segment_path,
+                 IoType::SegmentWrite,
+                 segment.write_all(&header)));
+    try!(wrap_io(segment_path,
+                 IoType::SegmentWrite,
+                 segment.write_all(byte_block)));
+    try!(wrap_io(segment_path, IoType::SegmentSync, segment.sync_data()));
+    *segment_position += 16 + byte_block.len() as u64;
     Ok(())
 }
 
 // call this if you fail to write an entry
-fn truncate_log(journal: &mut File, journal_path: &PathBuf, journal_position: u64) -> Result<()> {
-    try!(wrap_io(journal_path,
-                 IoType::JournalWrite,
-                 journal.seek(SeekFrom::Start(journal_position))));
-    try!(wrap_io(journal_path,
-                 IoType::JournalWrite,
-                 journal.write_all(&[0xFFu8, 16])));
-    try!(wrap_io(journal_path, IoType::JournalSync, journal.sync_data()));
+fn truncate_log(segment: &mut File, segment_path: &PathBuf, segment_position: u64) -> Result<()> {
+    try!(wrap_io(segment_path,
+                 IoType::SegmentWrite,
+                 segment.seek(SeekFrom::Start(segment_position))));
+    try!(wrap_io(segment_path,
+                 IoType::SegmentWrite,
+                 segment.write_all(&[0xFFu8, 16])));
+    try!(wrap_io(segment_path, IoType::SegmentSync, segment.sync_data()));
     Ok(())
-}
-
-struct JournalReadResult {
-    end_code: LogBlockError,
-    end_pos: u64,
-    saw_eof: bool,
 }
 
 impl Persister {
@@ -606,8 +585,8 @@ impl Persister {
     pub fn open(root: &Path, readonly: bool) -> Result<Self> {
         let root_path = root.to_owned();
         let lock_path = root.join("yrola.lock");
-        let wals_path = root.join("wals");
-        let objs_path = root.join("objs");
+        let segs_path = root.join("segments");
+        let objs_path = root.join("objects");
 
         match fs::metadata(root) {
             Ok(meta) => {
@@ -618,9 +597,9 @@ impl Persister {
             Err(err) => {
                 if err.kind() == ErrorKind::NotFound && !readonly {
                     try!(wrap_io(&root_path, IoType::CreateBase, fs::create_dir_all(root)));
-                    try!(wrap_io(&wals_path,
+                    try!(wrap_io(&segs_path,
                                  IoType::CreateLogDir,
-                                 fs::create_dir_all(&wals_path)));
+                                 fs::create_dir_all(&segs_path)));
                     try!(wrap_io(&objs_path,
                                  IoType::CreateObjDir,
                                  fs::create_dir_all(&objs_path)));
@@ -656,7 +635,7 @@ impl Persister {
             lock_file: lock_file,
             lock_path: lock_path.clone(),
             objs_path: objs_path.clone(),
-            wals_path: wals_path.clone(),
+            segs_path: segs_path.clone(),
             segments: HashMap::new(),
             objects: HashMap::new(),
             tombstones: HashMap::new(),
@@ -666,7 +645,7 @@ impl Persister {
             config: JournalConfig::default(),
         };
 
-        try!(pers.read_all_journals());
+        try!(pers.read_all_segments());
         if !readonly {
             try!(pers.clean_directories());
         }
@@ -674,22 +653,22 @@ impl Persister {
         Ok(pers)
     }
 
-    fn journal_path(&self, id: u64) -> PathBuf {
-        self.wals_path.join(format!("{:06}", id))
+    fn segment_path(&self, id: u64) -> PathBuf {
+        self.segs_path.join(format!("{:06}", id))
     }
 
-    fn read_journal(&mut self,
-                    journal_id: u64,
+    fn read_segment(&mut self,
+                    segment_id: u64,
                     closed_segment: bool,
                     mut list_out: Option<&mut HashSet<u64>>)
                     -> Result<(bool, u64)> {
-        let jpath = self.journal_path(journal_id);
-        let jfile = try!(wrap_io(&jpath, IoType::JournalOpen, File::open(&jpath)));
-        let jmeta = try!(wrap_io(&jpath, IoType::JournalStat, jfile.metadata()));
-        let (end_code, end_pos, jblocks) = try!(read_log_blocks_file(jfile, &jpath, journal_id));
+        let jpath = self.segment_path(segment_id);
+        let jfile = try!(wrap_io(&jpath, IoType::SegmentOpen, File::open(&jpath)));
+        let jmeta = try!(wrap_io(&jpath, IoType::SegmentStat, jfile.metadata()));
+        let (end_code, end_pos, jblocks) = try!(read_log_blocks_file(jfile, &jpath, segment_id));
 
-        assert!(!self.segments.contains_key(&journal_id));
-        self.segments.insert(journal_id,
+        assert!(!self.segments.contains_key(&segment_id));
+        self.segments.insert(segment_id,
                              SegmentInfo {
                                  live_object_ids: HashSet::new(),
                                  dead_object_ids: HashSet::new(),
@@ -739,7 +718,7 @@ impl Persister {
                     let newi_rr = try!(wrap_capnp(&jpath, commit.get_new_inline()));
                     for newi_r in newi_rr.iter() {
                         let hdr = try!(wrap_capnp(&jpath, newi_r.get_header()));
-                        try!(self.load_object(journal_id, ItemHandle {
+                        try!(self.load_object(segment_id, ItemHandle {
                             id: newi_r.get_id(),
                             header: Arc::new(Vec::from(hdr)),
                             body: ValueHandle::new(try!(wrap_capnp(&jpath, newi_r.get_data()))),
@@ -750,7 +729,7 @@ impl Persister {
                     for newe_r in newe_rr.iter() {
                         let dc = self.dir_control.clone();
                         let hdr = try!(wrap_capnp(&jpath, newe_r.get_header()));
-                        try!(self.load_object(journal_id, ItemHandle {
+                        try!(self.load_object(segment_id, ItemHandle {
                             id: newe_r.get_id(),
                             header: Arc::new(Vec::from(hdr)),
                             body: ValueHandle::new_external(
@@ -765,7 +744,7 @@ impl Persister {
                     let del_r = try!(wrap_capnp(&jpath, commit.get_deleted()));
                     for ix in 0..del_r.len() {
                         let del_id = del_r.get(ix);
-                        try!(self.load_tombstone(journal_id, del_id));
+                        try!(self.load_tombstone(segment_id, del_id));
                     }
 
                     let obs_r = try!(wrap_capnp(&jpath, commit.get_obsolete_segment_ids()));
@@ -789,7 +768,7 @@ impl Persister {
 
         if closed_segment {
             if !saw_eof {
-                return Err(Error::Corrupt(Corruption::UnclosedJournal {
+                return Err(Error::Corrupt(Corruption::UnclosedSegment {
                                               read_error: end_code,
                                               read_pos: end_pos,
                                           },
@@ -809,62 +788,62 @@ impl Persister {
         Ok(())
     }
 
-    fn load_object(&mut self, journal_id: u64, objh: ItemHandle) -> Result<()> {
+    fn load_object(&mut self, segment_id: u64, objh: ItemHandle) -> Result<()> {
         let object_id = objh.id();
         self.highwater_object_id = cmp::max(self.highwater_object_id, object_id);
         if let Some(old) = self.objects.get(&object_id) {
             return Err(Error::Corrupt(Corruption::DupObject {
                                           id: object_id,
-                                          other_file: self.journal_path(old.journal_id),
+                                          other_file: self.segment_path(old.segment_id),
                                       },
-                                      self.journal_path(journal_id)));
+                                      self.segment_path(segment_id)));
         }
 
         self.objects.insert(object_id,
                             ObjectInfo {
-                                journal_id: journal_id,
+                                segment_id: segment_id,
                                 data: objh,
                             });
 
-        self.segments.get_mut(&journal_id).unwrap().live_object_ids.insert(object_id);
+        self.segments.get_mut(&segment_id).unwrap().live_object_ids.insert(object_id);
         Ok(())
     }
 
-    fn load_tombstone(&mut self, journal_id: u64, object_id: u64) -> Result<()> {
+    fn load_tombstone(&mut self, segment_id: u64, object_id: u64) -> Result<()> {
         if let Some(old) = self.tombstones.get(&object_id) {
             return Err(Error::Corrupt(Corruption::DupTombstone {
                                           id: object_id,
-                                          other_file: self.journal_path(old.journal_id),
+                                          other_file: self.segment_path(old.segment_id),
                                       },
-                                      self.journal_path(journal_id)));
+                                      self.segment_path(segment_id)));
         }
 
-        self.tombstones.insert(object_id, TombstoneInfo { journal_id: journal_id });
+        self.tombstones.insert(object_id, TombstoneInfo { segment_id: segment_id });
 
-        self.segments.get_mut(&journal_id).unwrap().live_tombstone_ids.insert(object_id);
+        self.segments.get_mut(&segment_id).unwrap().live_tombstone_ids.insert(object_id);
         Ok(())
     }
 
-    fn read_all_journals(&mut self) -> Result<()> {
-        // find the journal with the highest number containing at least one valid block
-        let mut journal_names = Vec::new();
-        let wals_iter = try!(wrap_io(&self.wals_path,
-                                     IoType::JournalOpendir,
-                                     fs::read_dir(&self.wals_path)));
-        for rentry in wals_iter {
-            let entry = try!(wrap_io(&self.wals_path, IoType::JournalReaddir, rentry));
+    fn read_all_segments(&mut self) -> Result<()> {
+        // find the segment with the highest number containing at least one valid block
+        let mut segment_names = Vec::new();
+        let segs_iter = try!(wrap_io(&self.segs_path,
+                                     IoType::SegmentOpendir,
+                                     fs::read_dir(&self.segs_path)));
+        for rentry in segs_iter {
+            let entry = try!(wrap_io(&self.segs_path, IoType::SegmentReaddir, rentry));
             if let Some(jnum) = parse_object_filename(&*entry.file_name()) {
-                journal_names.push(jnum);
+                segment_names.push(jnum);
             }
         }
 
-        journal_names.sort();
-        journal_names.reverse();
+        segment_names.sort();
+        segment_names.reverse();
 
         let mut also_to_read = HashSet::new();
 
-        for jnum in &journal_names {
-            let (closed, write_pos) = try!(self.read_journal(*jnum,
+        for jnum in &segment_names {
+            let (closed, write_pos) = try!(self.read_segment(*jnum,
                                                              false,
                                                              Some(&mut also_to_read)));
 
@@ -881,12 +860,12 @@ impl Persister {
 
             if also_to_read.contains(jnum) {
                 return Err(Error::Corrupt(Corruption::SegmentIncludesSelf,
-                                          self.journal_path(*jnum)));
+                                          self.segment_path(*jnum)));
             }
         }
 
         for also_jnum in also_to_read {
-            try!(self.read_journal(also_jnum, true, None));
+            try!(self.read_segment(also_jnum, true, None));
         }
 
         let mut stale_ts = Vec::new();
@@ -895,13 +874,13 @@ impl Persister {
                 Some(obj_info) => {
                     // this is a deleted object
                     // segment must exist for any object or tombstone
-                    let mut oseg = self.segments.get_mut(&obj_info.journal_id).unwrap();
+                    let mut oseg = self.segments.get_mut(&obj_info.segment_id).unwrap();
                     oseg.live_object_ids.remove(deleted_id);
                     oseg.dead_object_ids.insert(*deleted_id);
                 }
                 None => {
                     // no object so the tombstone is dead
-                    let mut tseg = self.segments.get_mut(&tsinfo.journal_id).unwrap();
+                    let mut tseg = self.segments.get_mut(&tsinfo.segment_id).unwrap();
                     stale_ts.push(*deleted_id);
                     tseg.live_tombstone_ids.remove(deleted_id);
                 }
@@ -916,11 +895,11 @@ impl Persister {
     }
 
     fn clean_directories(&mut self) -> Result<()> {
-        let wals_iter = try!(wrap_io(&self.wals_path,
+        let segs_iter = try!(wrap_io(&self.segs_path,
                                      IoType::CleanupOpendir,
-                                     fs::read_dir(&self.wals_path)));
-        for rentry in wals_iter {
-            let entry = try!(wrap_io(&self.wals_path, IoType::CleanupReaddir, rentry));
+                                     fs::read_dir(&self.segs_path)));
+        for rentry in segs_iter {
+            let entry = try!(wrap_io(&self.segs_path, IoType::CleanupReaddir, rentry));
             if let Some(jnum) = parse_object_filename(&*entry.file_name()) {
                 if self.segments.contains_key(&jnum) {
                     continue;
@@ -1048,21 +1027,21 @@ impl Persister {
 
         // TODO(someday): repeatedly looking up the current segment is sub-optimal
         for moved_obj_id in &seginfo.live_object_ids {
-            self.objects.get_mut(moved_obj_id).unwrap().journal_id = write_seg_id;
+            self.objects.get_mut(moved_obj_id).unwrap().segment_id = write_seg_id;
             self.segments.get_mut(&write_seg_id).unwrap().live_object_ids.insert(*moved_obj_id);
         }
 
         for moved_ts_id in &seginfo.live_tombstone_ids {
-            self.tombstones.get_mut(moved_ts_id).unwrap().journal_id = write_seg_id;
+            self.tombstones.get_mut(moved_ts_id).unwrap().segment_id = write_seg_id;
             self.segments.get_mut(&write_seg_id).unwrap().live_tombstone_ids.insert(*moved_ts_id);
         }
 
         // these objects will never be seen again, so the corresponding tombstones are dead
         for retired_obj_id in &seginfo.dead_object_ids {
             let old_ts_info = self.tombstones.remove(retired_obj_id).unwrap();
-            if old_ts_info.journal_id != segment_id {
+            if old_ts_info.segment_id != segment_id {
                 self.segments
-                    .get_mut(&old_ts_info.journal_id)
+                    .get_mut(&old_ts_info.segment_id)
                     .unwrap()
                     .live_tombstone_ids
                     .remove(retired_obj_id);
