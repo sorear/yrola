@@ -11,7 +11,7 @@ use std::io::{self, ErrorKind, Read, Write, SeekFrom, Seek};
 use std::path::{Path, PathBuf};
 use std::result;
 use std::str::FromStr;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use std::u32;
 use std::u64;
 use yrola_capnp;
@@ -51,11 +51,13 @@ pub enum IoType {
     SegmentWrite,
     SegmentSync,
     SegmentCreate,
+    SegmentDelete,
     CleanupOpendir,
     CleanupReaddir,
     CleanupDelete,
     ObjectOpen,
     ObjectRead,
+    ObjectDelete,
 }
 
 #[derive(Debug)]
@@ -85,8 +87,8 @@ pub enum Corruption {
 pub type Result<T> = result::Result<T, Error>;
 
 struct ObjDirControl {
-    disconnected: RwLock<bool>,
     base_dir: PathBuf,
+    delete_queue: Mutex<Vec<u64>>,
 }
 
 struct FileControl {
@@ -95,6 +97,7 @@ struct FileControl {
     size: u64,
     hash: u64,
     loaded_data: Mutex<Option<Arc<Vec<u8>>>>,
+    pending_delete: Mutex<bool>,
 }
 
 #[derive(Clone)]
@@ -176,6 +179,7 @@ pub struct Persister {
     highwater_segment_id: u64,
     open_segment: Option<OpenSegmentInfo>,
     config: JournalConfig,
+    pending_delete_segment: Vec<u64>,
 }
 
 #[derive(Debug)]
@@ -193,7 +197,7 @@ const MAX_SEGMENT_CHANGES: u32 = 1 << 20;
 const MAX_SEGMENT_COUNT: usize = 1 << 20;
 const MAX_HEADER_LEN: usize = 1 << 20;
 // TODO(someday): Tuning parameter
-const MAX_INLINE_LEN: usize = 1 << 20;
+const MAX_INLINE_LEN: usize = 1 << 15;
 const TARGET_SEGMENT_SIZE: u64 = 1 << 24;
 
 fn wrap_capnp<S, E>(path: &PathBuf, res: result::Result<S, E>) -> Result<S>
@@ -222,13 +226,19 @@ impl ObjDirControl {
     fn new(path: &PathBuf) -> Self {
         ObjDirControl {
             base_dir: path.clone(),
-            disconnected: RwLock::new(false),
+            delete_queue: Mutex::new(Vec::new()),
         }
     }
+}
 
-    fn close(&self) {
-        let mut closed_lock = self.disconnected.write().unwrap();
-        *closed_lock = true;
+impl Drop for FileControl {
+    fn drop(&mut self) {
+        let lock_del = self.pending_delete.lock().unwrap();
+        if *lock_del {
+            let mut lock_q = self.dir_control.delete_queue.lock().unwrap();
+            lock_q.push(self.id);
+            // the actual delete happens on the next commit.
+        }
     }
 }
 
@@ -248,6 +258,16 @@ impl ValueHandle {
         }
     }
 
+    fn mark_delete(&self, should_delete: bool) {
+        match *self {
+            ValueHandle::SmallData(_) => {}
+            ValueHandle::LargeData(ref file) => {
+                let mut lock = file.pending_delete.lock().unwrap();
+                *lock = should_delete;
+            }
+        }
+    }
+
     fn new_external(dir: Arc<ObjDirControl>, id: u64, size: u64, hash: u64) -> ValueHandle {
         let fc = Arc::new(FileControl {
             dir_control: dir,
@@ -255,6 +275,7 @@ impl ValueHandle {
             size: size,
             hash: hash,
             loaded_data: Mutex::new(None),
+            pending_delete: Mutex::new(false),
         });
         ValueHandle::LargeData(fc)
     }
@@ -267,11 +288,6 @@ impl ValueHandle {
                 let mut data_lock = fl.loaded_data.lock().unwrap();
                 if let Some(ref data) = *data_lock {
                     return Ok(ValuePin { data: data.clone() });
-                }
-
-                let dcon_lock = fl.dir_control.disconnected.read().unwrap();
-                if *dcon_lock {
-                    return Err(Error::Disconnected);
                 }
 
                 let path = fl.dir_control.base_dir.join(format!("{:06}", fl.id));
@@ -416,6 +432,8 @@ impl<'a> Transaction<'a> {
             return Err(Error::Exhausted(exhtype));
         }
 
+        try!(self.journal.flush_deletes());
+
         let mut msg_builder = capnp::message::Builder::new_default();
 
         {
@@ -497,14 +515,11 @@ impl<'a> Transaction<'a> {
                     .insert(ts_id);
             }
 
-            match obj_info.data.body {
-                ValueHandle::SmallData(_) => {}
-                ValueHandle::LargeData(ref file) => {
-                    // this is not allowed to fail the commit
-                    self.journal.delete_object_soon(file.clone());
-                }
-            }
+            obj_info.data.body.mark_delete(true);
         }
+
+        // if this fails, we'll try again and fail the next commit
+        let _ = self.journal.flush_deletes();
 
         Ok(())
     }
@@ -706,6 +721,7 @@ impl Persister {
             highwater_segment_id: 0,
             open_segment: None,
             dir_control: Arc::new(ObjDirControl::new(&objs_path)),
+            pending_delete_segment: Vec::new(),
             config: JournalConfig::default(),
         };
 
@@ -1279,19 +1295,34 @@ impl Persister {
         }
 
         self.segments.remove(&segment_id);
+        self.pending_delete_segment.push(segment_id);
+        try!(self.flush_deletes());
         Ok(())
     }
 
-    fn delete_object_soon(&mut self, _file: Arc<FileControl>) {
-        unimplemented!()
+    fn flush_deletes(&mut self) -> Result<()> {
+        let mut obj_delete_lock = self.dir_control.delete_queue.lock().unwrap();
+
+        while !obj_delete_lock.is_empty() {
+            let obj_id = obj_delete_lock[obj_delete_lock.len() - 1];
+            let obj_path = self.objs_path.join(format!("{:06}", obj_id));
+            try!(wrap_io(&obj_path, IoType::ObjectDelete, fs::remove_file(&obj_path)));
+            obj_delete_lock.pop();
+        }
+
+        while !self.pending_delete_segment.is_empty() {
+            let seg_id = self.pending_delete_segment[self.pending_delete_segment.len() - 1];
+            let seg_path = self.segment_path(seg_id);
+            try!(wrap_io(&seg_path, IoType::SegmentDelete, fs::remove_file(&seg_path)));
+            self.pending_delete_segment.pop();
+        }
+
+        Ok(())
     }
 }
 
-impl Drop for Persister {
-    fn drop(&mut self) {
-        self.dir_control.close();
-    }
-}
+// dropping a Persister guarantees no further *writes*, but any existing ValueHandle can
+// cause a read.  We could implement a hard disconnect in the future, but it'd be ugly with mmap.
 
 #[cfg(test)]
 mod tests;
