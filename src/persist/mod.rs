@@ -144,6 +144,8 @@ struct SegmentInfo {
 
     // not valid for the open segment
     on_disk_size: u64,
+    // a guess of the space that will be used after evacuation (except constant overhead)
+    live_size: u64,
 }
 
 struct OpenSegmentInfo {
@@ -183,6 +185,9 @@ pub struct Connection {
     open_segment: Option<OpenSegmentInfo>,
     config: JournalConfig,
     pending_delete_segment: Vec<u64>,
+
+    live_size: u64,
+    on_disk_size: u64,
 }
 
 #[derive(Debug)]
@@ -199,9 +204,16 @@ const YROLA_SIGNATURE: &'static [u8] = b"Yrola Journal format <0>\n";
 const MAX_SEGMENT_CHANGES: u32 = 1 << 20;
 const MAX_SEGMENT_COUNT: usize = 1 << 20;
 const MAX_HEADER_LEN: usize = 1 << 20;
+const TOMBSTONE_SIZE: u64 = 8;
+const EXTERNAL_OBJ_SIZE: u64 = 32;
+const INLINE_OBJ_SIZE: u64 = 24;
+const FLAT_OVERHEAD: u64 = 4000;
+const OVERHEAD_PER_SEGMENT: u64 = 8;
+
 // TODO(someday): Tuning parameter
 const MAX_INLINE_LEN: usize = 1 << 15;
 const TARGET_SEGMENT_SIZE: u64 = 1 << 24;
+const TARGET_RATIO: f64 = 0.3;
 
 fn wrap_capnp<S, E>(path: &PathBuf, res: result::Result<S, E>) -> Result<S>
     where capnp::Error: From<E>
@@ -328,6 +340,16 @@ impl ItemHandle {
 
     pub fn body(&self) -> &ValueHandle {
         &self.body
+    }
+
+    fn live_size(&self) -> u64 {
+        let header = (self.header.len() as u64 + 7) & !7;
+        match self.body {
+            ValueHandle::SmallData(ref data) => {
+                INLINE_OBJ_SIZE + header + ((data.len() as u64 + 7) & !7)
+            }
+            ValueHandle::LargeData(_) => EXTERNAL_OBJ_SIZE + header,
+        }
     }
 }
 
@@ -458,6 +480,7 @@ impl<'a> Transaction<'a> {
         }
 
         try!(self.journal.flush_deletes());
+        try!(self.journal.vacuum());
 
         let mut msg_builder = capnp::message::Builder::new_default();
 
@@ -561,12 +584,15 @@ impl<'a> Transaction<'a> {
 
         // we wrote it to the journal, now update our data structures
         for (obj_id, ith) in self.new_items {
+            let mut wr_seg = self.journal.segments.get_mut(&write_seg_id).unwrap();
+            wr_seg.live_object_ids.insert(obj_id);
+            wr_seg.live_size += ith.live_size();
+            self.journal.live_size += ith.live_size();
             self.journal.objects.insert(obj_id,
                                         ObjectInfo {
                                             segment_id: write_seg_id,
                                             data: ith,
                                         });
-            self.journal.segments.get_mut(&write_seg_id).unwrap().live_object_ids.insert(obj_id);
         }
 
         for ts_id in self.del_items {
@@ -578,6 +604,8 @@ impl<'a> Transaction<'a> {
                 {
                     let mut obj_seg = self.journal.segments.get_mut(&obj_info.segment_id).unwrap();
                     obj_seg.live_object_ids.remove(&ts_id);
+                    obj_seg.live_size -= obj_info.data.live_size();
+                    self.journal.live_size -= obj_info.data.live_size();
                 }
             } else {
                 // we need to track this tombstone if the segment is evacuated later, and track the
@@ -586,14 +614,19 @@ impl<'a> Transaction<'a> {
                     let mut obj_seg = self.journal.segments.get_mut(&obj_info.segment_id).unwrap();
                     obj_seg.live_object_ids.remove(&ts_id);
                     obj_seg.dead_object_ids.insert(ts_id);
+                    obj_seg.live_size -= obj_info.data.live_size();
+                    self.journal.live_size -= obj_info.data.live_size();
                 }
                 self.journal.tombstones.insert(ts_id, TombstoneInfo { segment_id: write_seg_id });
-                self.journal
-                    .segments
-                    .get_mut(&write_seg_id)
-                    .unwrap()
-                    .live_tombstone_ids
-                    .insert(ts_id);
+                let mut wseg_info = self.journal
+                                        .segments
+                                        .get_mut(&write_seg_id)
+                                        .unwrap();
+
+                wseg_info.live_tombstone_ids
+                         .insert(ts_id);
+                wseg_info.live_size += TOMBSTONE_SIZE;
+                self.journal.live_size += TOMBSTONE_SIZE;
             }
 
             obj_info.data.body.mark_delete(true);
@@ -805,6 +838,8 @@ impl Connection {
             dir_control: Arc::new(ObjDirControl::new(&objs_path)),
             pending_delete_segment: Vec::new(),
             config: JournalConfig::default(),
+            live_size: 0,
+            on_disk_size: 0,
         };
 
         try!(pers.read_all_segments());
@@ -840,7 +875,11 @@ impl Connection {
                                  dead_object_ids: HashSet::new(),
                                  live_tombstone_ids: HashSet::new(),
                                  on_disk_size: jmeta.len(),
+                                 live_size: 0,
                              });
+        if closed_segment {
+            self.on_disk_size += jmeta.len();
+        }
 
         let mut saw_header = false;
         let mut saw_eof = false;
@@ -978,13 +1017,17 @@ impl Connection {
                                       self.segment_path(segment_id)));
         }
 
+        let mut seg_info = self.segments.get_mut(&segment_id).unwrap();
+        seg_info.live_object_ids.insert(object_id);
+        seg_info.live_size += objh.live_size();
+        self.live_size += objh.live_size();
+
         self.objects.insert(object_id,
                             ObjectInfo {
                                 segment_id: segment_id,
                                 data: objh,
                             });
 
-        self.segments.get_mut(&segment_id).unwrap().live_object_ids.insert(object_id);
         Ok(())
     }
 
@@ -999,7 +1042,10 @@ impl Connection {
 
         self.tombstones.insert(object_id, TombstoneInfo { segment_id: segment_id });
 
-        self.segments.get_mut(&segment_id).unwrap().live_tombstone_ids.insert(object_id);
+        let mut seg_info = self.segments.get_mut(&segment_id).unwrap();
+        seg_info.live_tombstone_ids.insert(object_id);
+        seg_info.live_size += TOMBSTONE_SIZE;
+        self.live_size += TOMBSTONE_SIZE;
         Ok(())
     }
 
@@ -1067,6 +1113,8 @@ impl Connection {
                     // segment must exist for any object or tombstone
                     let mut oseg = self.segments.get_mut(&obj_info.segment_id).unwrap();
                     oseg.live_object_ids.remove(deleted_id);
+                    oseg.live_size -= obj_info.data.live_size();
+                    self.live_size -= obj_info.data.live_size();
                     oseg.dead_object_ids.insert(*deleted_id);
                 }
                 None => {
@@ -1074,6 +1122,8 @@ impl Connection {
                     let mut tseg = self.segments.get_mut(&tsinfo.segment_id).unwrap();
                     stale_ts.push(*deleted_id);
                     tseg.live_tombstone_ids.remove(deleted_id);
+                    tseg.live_size -= TOMBSTONE_SIZE;
+                    self.live_size -= TOMBSTONE_SIZE;
                 }
             }
         }
@@ -1151,7 +1201,9 @@ impl Connection {
             try!(self.write_block(0, &*msg_words));
 
             let final_state = self.open_segment.take().unwrap();
-            self.segments.get_mut(&final_state.id).unwrap().on_disk_size = final_state.offset;
+            let mut finished_seg = self.segments.get_mut(&final_state.id).unwrap();
+            finished_seg.on_disk_size = final_state.offset;
+            self.on_disk_size += final_state.offset;
         }
 
         if self.open_segment.is_none() {
@@ -1185,6 +1237,7 @@ impl Connection {
                                      dead_object_ids: HashSet::new(),
                                      live_tombstone_ids: HashSet::new(),
                                      on_disk_size: 0,
+                                     live_size: 0,
                                  });
         }
 
@@ -1266,6 +1319,35 @@ impl Connection {
                 e
             }
         }
+    }
+
+    fn vacuum(&mut self) -> Result<()> {
+        let disk_size = self.on_disk_size;
+        let mut live_data_size = self.live_size;
+
+        if let Some(oseginf) = self.open_segment.as_ref() {
+            live_data_size -= self.segments.get(&oseginf.id).unwrap().live_size;
+        }
+
+        let segment_count = 1 + 2 * live_data_size / TARGET_SEGMENT_SIZE;
+        live_data_size += segment_count * FLAT_OVERHEAD;
+
+        if live_data_size < (disk_size as f64 * TARGET_RATIO) as u64 {
+            let mut emptiest_segid = None;
+            let mut emptiest_bytes = u64::MAX;
+            for (seg_id, seg_info) in &self.segments {
+                if seg_info.live_size < emptiest_bytes {
+                    emptiest_bytes = seg_info.live_size;
+                    emptiest_segid = Some(*seg_id);
+                }
+            }
+
+            if let Some(id) = emptiest_segid {
+                try!(self.evacuate(id));
+            }
+        }
+
+        Ok(())
     }
 
     fn evacuate(&mut self, segment_id: u64) -> Result<()> {
@@ -1359,28 +1441,40 @@ impl Connection {
 
         // TODO(someday): repeatedly looking up the current segment is sub-optimal
         for moved_obj_id in &seginfo.live_object_ids {
-            self.objects.get_mut(moved_obj_id).unwrap().segment_id = write_seg_id;
-            self.segments.get_mut(&write_seg_id).unwrap().live_object_ids.insert(*moved_obj_id);
+            let mut obj_info = self.objects.get_mut(moved_obj_id).unwrap();
+            obj_info.segment_id = write_seg_id;
+            let mut wr_seg_info = self.segments.get_mut(&write_seg_id).unwrap();
+            wr_seg_info.live_object_ids.insert(*moved_obj_id);
+            wr_seg_info.live_size += obj_info.data.live_size();
+            self.live_size += obj_info.data.live_size();
         }
 
         for moved_ts_id in &seginfo.live_tombstone_ids {
             self.tombstones.get_mut(moved_ts_id).unwrap().segment_id = write_seg_id;
-            self.segments.get_mut(&write_seg_id).unwrap().live_tombstone_ids.insert(*moved_ts_id);
+            let mut wr_seg_info = self.segments.get_mut(&write_seg_id).unwrap();
+            wr_seg_info.live_tombstone_ids.insert(*moved_ts_id);
+            wr_seg_info.live_size += TOMBSTONE_SIZE;
+            self.live_size += TOMBSTONE_SIZE;
         }
 
         // these objects will never be seen again, so the corresponding tombstones are dead
         for retired_obj_id in &seginfo.dead_object_ids {
             let old_ts_info = self.tombstones.remove(retired_obj_id).unwrap();
             if old_ts_info.segment_id != segment_id {
-                self.segments
-                    .get_mut(&old_ts_info.segment_id)
-                    .unwrap()
-                    .live_tombstone_ids
-                    .remove(retired_obj_id);
+                let mut seg_info = self.segments
+                                       .get_mut(&old_ts_info.segment_id)
+                                       .unwrap();
+
+                seg_info.live_tombstone_ids
+                        .remove(retired_obj_id);
+                seg_info.live_size -= TOMBSTONE_SIZE;
+                self.live_size -= TOMBSTONE_SIZE;
             }
         }
 
-        self.segments.remove(&segment_id);
+        let dead_seg = self.segments.remove(&segment_id).unwrap();
+        self.live_size -= dead_seg.live_size;
+        self.on_disk_size -= dead_seg.on_disk_size;
         self.pending_delete_segment.push(segment_id);
         try!(self.flush_deletes());
         Ok(())
