@@ -22,16 +22,10 @@ struct LevelReader {
     bundle_index: Option<u32>,
 }
 
-#[derive(Clone)]
-enum LevelOrSavepoint {
-    Level(LevelHandle),
-    Savepoint(String),
-}
-
 pub struct Transaction {
     start_stamp: u64,
     committed: Vec<LevelHandle>,
-    uncommitted: Vec<LevelOrSavepoint>,
+    uncommitted: Vec<LevelHandle>,
 }
 
 #[derive(Default)]
@@ -138,10 +132,8 @@ impl Transaction {
         for levelp in &self.committed {
             log.push(levelp);
         }
-        for lors in &self.uncommitted {
-            if let LevelOrSavepoint::Level(ref l) = *lors {
-                log.push(l);
-            }
+        for levelp in &self.uncommitted {
+            log.push(levelp);
         }
         log
     }

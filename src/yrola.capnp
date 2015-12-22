@@ -65,7 +65,7 @@ struct ItemHeader {
   }
 }
 
-# a level might not know anything about stamps, if it's part of an uncommited txn
+# a level might not know anything about stamps, if it's part of an uncommitted txn
 struct Level {
   tablesChanged @0 :List(LevelTableChange);
 }
