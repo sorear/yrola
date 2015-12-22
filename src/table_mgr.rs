@@ -4,10 +4,12 @@ use capnp::message;
 use capnp::serialize;
 use capnp::traits::FromPointerReader;
 use persist::{self, ValueHandle, ValuePin};
+use std::cmp;
 use std::cmp::Ordering;
 use std::path::Path;
 use std::result;
 use std::sync::Mutex;
+use std::u64;
 use yrola_capnp::{level, bundle, level_table_change};
 
 // a levelhandle does NOT know its own place...
@@ -43,6 +45,8 @@ pub enum Error {
     DbTooOld(u32),
     DbTooNew(u32),
     WrongApp(String),
+    NoSuchTable(u64),
+    TableIdsExhausted,
 }
 
 pub type Result<T> = result::Result<T, Error>;
@@ -126,6 +130,29 @@ impl From<persist::Error> for Error {
     }
 }
 
+macro_rules! for_level {
+    ($self_:expr, $id:ident in $block:block) => {
+        for level in $self_.get_changelog().iter().rev() {
+            let $id = try!(level.get_level_reader());
+            $block
+        }
+    }
+}
+
+macro_rules! for_table {
+    ($self_:expr, $table_id:expr, $id:ident in $block:block) => {
+        for_level!($self_, level_r in {
+            let $id = try!(level_r.get_table_ptr($table_id));
+            if $id.get_created() {
+                $block
+            }
+            if $id.get_dropped() {
+                break;
+            }
+        });
+    }
+}
+
 impl Transaction {
     fn get_changelog(&self) -> Vec<&LevelHandle> {
         let mut log = Vec::new();
@@ -139,26 +166,54 @@ impl Transaction {
     }
 
     fn table_exists(&self, table_id: u64) -> Result<bool> {
-        for level in self.get_changelog().iter().rev() {
-            let level_r = try!(level.get_level_reader());
-            let table_r = try!(level_r.get_table_ptr(table_id));
-            if table_r.get_created() {
-                return Ok(true);
-            }
-            if table_r.get_dropped() {
-                break;
-            }
-        }
+        for_table!(self, table_id, level_r in {
+            return Ok(true);
+        });
         return Ok(false);
     }
 
-    pub fn create_table(&mut self, _options: TableCreateOptions) -> Result<u64> {
-        unimplemented!()
+    fn push_uncommitted_level(&mut self,
+                              message_b: &message::Builder<message::HeapAllocator>)
+                              -> Result<()> {
+        let words = serialize::write_message_to_words(&message_b);
+        self.uncommitted.push(LevelHandle {
+            bundle_index: None,
+            value: ValueHandle::new_words(&words[..]),
+        });
+        // TODO(soon): compaction
+        Ok(())
+    }
+
+    pub fn create_table(&mut self, options: TableCreateOptions) -> Result<u64> {
+        let mut highwater = 0;
+        for_level!(self, level_r in {
+            let level_reader = try!(level_r.get_level_ptr());
+            let changed_reader = try!(level_reader.get_tables_changed());
+            if changed_reader.len() > 0 {
+                let last_reader = changed_reader.get(changed_reader.len() - 1);
+                highwater = cmp::max(highwater, last_reader.get_table_id());
+            }
+        });
+
+        if highwater == u64::MAX {
+            return Err(Error::TableIdsExhausted);
+        }
+
+        let mut message_b = message::Builder::new_default();
+        {
+            let level_b = message_b.init_root::<level::Builder>();
+            let mut tc_b = level_b.init_tables_changed(1).get(0);
+            tc_b.set_created(true);
+            tc_b.set_table_id(highwater + 1);
+            tc_b.set_key_count(options.key_count);
+        }
+        try!(self.push_uncommitted_level(&message_b));
+        Ok(highwater + 1)
     }
 
     pub fn drop_table(&mut self, id: u64) -> Result<()> {
-        if try!(self.table_exists(id)) {
-            unimplemented!();
+        if !try!(self.table_exists(id)) {
+            return Err(Error::NoSuchTable(id));
         }
 
         let mut message_b = message::Builder::new_default();
@@ -168,13 +223,7 @@ impl Transaction {
             tc_b.set_dropped(true);
             tc_b.set_table_id(id);
         }
-
-        let words = serialize::write_message_to_words(&message_b);
-        self.uncommitted.push(LevelOrSavepoint::Level(LevelHandle {
-            bundle_index: None,
-            value: ValueHandle::new_words(&words[..]),
-        }));
-        // TODO(soon): compaction
+        try!(self.push_uncommitted_level(&message_b));
         Ok(())
     }
 
