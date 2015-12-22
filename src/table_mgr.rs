@@ -1,12 +1,14 @@
-use persist::{self, ValueHandle, ValuePin};
-use std::result;
-use yrola_capnp::{level, bundle, level_table_change};
 use borrow_segments::{self, BorrowSegments};
-use capnp::serialize;
-use capnp::message;
 use capnp;
-use std::cmp::Ordering;
+use capnp::message;
+use capnp::serialize;
 use capnp::traits::FromPointerReader;
+use persist::{self, ValueHandle, ValuePin};
+use std::cmp::Ordering;
+use std::path::Path;
+use std::result;
+use std::sync::Mutex;
+use yrola_capnp::{level, bundle, level_table_change};
 
 // a levelhandle does NOT know its own place...
 #[derive(Clone)]
@@ -26,10 +28,10 @@ enum LevelOrSavepoint {
     Savepoint(String),
 }
 
-struct Transaction {
+pub struct Transaction {
     start_stamp: u64,
     committed: Vec<LevelHandle>,
-    uncomitted: Vec<LevelOrSavepoint>,
+    uncommitted: Vec<LevelOrSavepoint>,
 }
 
 #[derive(Default)]
@@ -41,9 +43,19 @@ pub struct TableMetadata {
     exists: bool,
 }
 
-pub enum Error {}
+pub enum Error {
+    Persist(persist::Error),
+    Capnp(capnp::Error),
+    DbTooOld(u32),
+    DbTooNew(u32),
+    WrongApp(String),
+}
 
 pub type Result<T> = result::Result<T, Error>;
+
+pub struct Connection {
+    pconn: Mutex<persist::Connection>,
+}
 
 impl LevelHandle {
     fn get_level_reader(&self) -> Result<LevelReader> {
@@ -109,14 +121,14 @@ impl LevelReader {
 }
 
 impl From<capnp::Error> for Error {
-    fn from(_err: capnp::Error) -> Error {
-        unimplemented!()
+    fn from(err: capnp::Error) -> Error {
+        Error::Capnp(err)
     }
 }
 
 impl From<persist::Error> for Error {
-    fn from(_err: persist::Error) -> Error {
-        unimplemented!()
+    fn from(err: persist::Error) -> Error {
+        Error::Persist(err)
     }
 }
 
@@ -126,7 +138,7 @@ impl Transaction {
         for levelp in &self.committed {
             log.push(levelp);
         }
-        for lors in &self.uncomitted {
+        for lors in &self.uncommitted {
             if let LevelOrSavepoint::Level(ref l) = *lors {
                 log.push(l);
             }
@@ -166,7 +178,7 @@ impl Transaction {
         }
 
         let words = serialize::write_message_to_words(&message_b);
-        self.uncomitted.push(LevelOrSavepoint::Level(LevelHandle {
+        self.uncommitted.push(LevelOrSavepoint::Level(LevelHandle {
             bundle_index: None,
             value: ValueHandle::new_words(&words[..]),
         }));
@@ -176,5 +188,55 @@ impl Transaction {
 
     pub fn commit(self) -> Result<()> {
         unimplemented!()
+    }
+}
+
+const DB_APP_NAME: &'static str = "YrolaDatabase";
+const DB_READ_VERSION: u32 = 0;
+const DB_WRITE_VERSION: u32 = 0;
+
+impl Connection {
+    pub fn open(db_path: &Path, read_only: bool) -> Result<Self> {
+        let mut pconn = try!(persist::Connection::open(db_path, read_only));
+
+        {
+            let mut tx = pconn.transaction();
+
+            let is_blank = tx.config().app_name == "";
+            if is_blank && !read_only {
+                tx.new_config().app_name = DB_APP_NAME.to_owned();
+                tx.new_config().app_version = DB_WRITE_VERSION;
+            }
+
+            if tx.config().app_name != DB_APP_NAME {
+                return Err(Error::WrongApp(tx.config().app_name.clone()));
+            }
+            if tx.config().app_version < DB_READ_VERSION {
+                return Err(Error::DbTooOld(tx.config().app_version));
+            }
+            if tx.config().app_version > DB_WRITE_VERSION {
+                return Err(Error::DbTooNew(tx.config().app_version));
+            }
+
+            tx.new_config().app_version = DB_WRITE_VERSION;
+            try!(tx.commit());
+        }
+
+        Ok(Connection { pconn: Mutex::new(pconn) })
+    }
+
+    pub fn transaction(&self) -> Transaction {
+        let mut conn_lock = self.pconn.lock().unwrap();
+        let mut read_tx = conn_lock.transaction();
+
+        if read_tx.list_items().count() != 0 {
+            unimplemented!()
+        }
+
+        Transaction {
+            start_stamp: 1,
+            committed: Vec::new(),
+            uncommitted: Vec::new(),
+        }
     }
 }

@@ -166,9 +166,9 @@ struct OpenSegmentInfo {
 }
 
 #[derive(Clone, Default, Debug)]
-struct JournalConfig {
-    app_name: String,
-    app_version: u32,
+pub struct JournalConfig {
+    pub app_name: String,
+    pub app_version: u32,
 }
 
 // Naturally we need to track the live objects.  To support evacuation, we need
@@ -196,6 +196,14 @@ pub struct Connection {
 
     live_size: u64,
     on_disk_size: u64,
+}
+
+pub struct Transaction<'a> {
+    journal: &'a mut Connection,
+    new_items: HashMap<u64, ItemHandle>,
+    del_items: HashSet<u64>,
+    new_config: Option<JournalConfig>,
+    large_objects: Vec<(File, PathBuf, ValueHandle)>,
 }
 
 #[derive(Debug)]
@@ -353,9 +361,7 @@ impl ItemHandle {
     fn live_size(&self) -> u64 {
         let header = (self.header.len() as u64 + 7) & !7;
         match self.body.0 {
-            ValueImp::Small(ref data) => {
-                INLINE_OBJ_SIZE + header + ((data.len() as u64 + 7) & !7)
-            }
+            ValueImp::Small(ref data) => INLINE_OBJ_SIZE + header + ((data.len() as u64 + 7) & !7),
             ValueImp::Large(_) => EXTERNAL_OBJ_SIZE + header,
         }
     }
@@ -391,13 +397,6 @@ impl<'a> Iterator for ItemIterator<'a> {
             return None;
         }
     }
-}
-
-pub struct Transaction<'a> {
-    journal: &'a mut Connection,
-    new_items: HashMap<u64, ItemHandle>,
-    del_items: HashSet<u64>,
-    large_objects: Vec<(File, PathBuf, ValueHandle)>,
 }
 
 impl<'a> Transaction<'a> {
@@ -478,6 +477,18 @@ impl<'a> Transaction<'a> {
             new_iter_done: false,
             deleted: &self.del_items,
         }
+    }
+
+    pub fn config(&self) -> &JournalConfig {
+        self.new_config.as_ref().unwrap_or(&self.journal.config)
+    }
+
+    pub fn new_config(&mut self) -> &mut JournalConfig {
+        if self.new_config.is_none() {
+            self.new_config = Some(self.journal.config.clone());
+        }
+
+        self.new_config.as_mut().unwrap()
     }
 
     pub fn commit(self) -> Result<()> {
@@ -568,6 +579,10 @@ impl<'a> Transaction<'a> {
                     ts_ix += 1;
                 }
             }
+
+            if let Some(ref new_config) = self.new_config {
+                new_config.save((&mut commit_builder).borrow().init_new_config());
+            }
         }
 
         let msg_words = capnp::serialize::write_message_to_words(&msg_builder);
@@ -588,6 +603,10 @@ impl<'a> Transaction<'a> {
                 }
                 return e;
             }
+        }
+
+        if let Some(ref new_config) = self.new_config {
+            self.journal.config = new_config.clone();
         }
 
         // we wrote it to the journal, now update our data structures
@@ -774,6 +793,13 @@ fn truncate_log(segment: &mut File, segment_path: &PathBuf, segment_position: u6
     Ok(())
 }
 
+impl JournalConfig {
+    fn save<'a>(&self, mut builder: yrola_capnp::journal_config::Builder<'a>) {
+        builder.set_app_name(&*self.app_name);
+        builder.set_app_version(self.app_version);
+    }
+}
+
 impl Connection {
     pub fn transaction(&mut self) -> Transaction {
         Transaction {
@@ -781,6 +807,7 @@ impl Connection {
             new_items: HashMap::new(),
             del_items: HashSet::new(),
             large_objects: Vec::new(),
+            new_config: None,
         }
     }
 
@@ -821,7 +848,10 @@ impl Connection {
 
         let mut lock_file = try!(wrap_io(&lock_path,
                                          IoType::LockOpen,
-                                         OpenOptions::new().write(true).read(true).open(&lock_path)));
+                                         OpenOptions::new()
+                                             .write(true)
+                                             .read(true)
+                                             .open(&lock_path)));
         try!(wrap_io(&lock_path, IoType::Lock, lock_file.lock_exclusive()));
         trace!("open {:?}", root_path);
         {
@@ -882,7 +912,11 @@ impl Connection {
         let (end_code, end_pos, jblocks) = try!(read_log_blocks_file(jfile, &jpath, segment_id));
 
         assert!(!self.segments.contains_key(&segment_id));
-        trace!("load segment {:?} {:?} {:?} {:?}", segment_id, end_code, end_pos, jblocks.len());
+        trace!("load segment {:?} {:?} {:?} {:?}",
+               segment_id,
+               end_code,
+               end_pos,
+               jblocks.len());
         self.segments.insert(segment_id,
                              SegmentInfo {
                                  live_object_ids: HashSet::new(),
@@ -1014,11 +1048,6 @@ impl Connection {
         self.config.app_version = reader.get_app_version();
         trace!("load config {:?}", self.config);
         Ok(())
-    }
-
-    fn save_config<'a>(&self, mut builder: yrola_capnp::journal_config::Builder<'a>) {
-        builder.set_app_name(&*self.config.app_name);
-        builder.set_app_version(self.config.app_version);
     }
 
     fn load_object(&mut self, segment_id: u64, objh: ItemHandle) -> Result<()> {
@@ -1165,8 +1194,8 @@ impl Connection {
             }
             trace!("clean: delete {:?}", &entry.path());
             try!(wrap_io(&entry.path(),
-            IoType::CleanupDelete,
-            fs::remove_file(entry.path())));
+                         IoType::CleanupDelete,
+                         fs::remove_file(entry.path())));
         }
 
         let objs_iter = try!(wrap_io(&self.objs_path,
@@ -1179,10 +1208,10 @@ impl Connection {
                     continue;
                 }
             }
-                trace!("clean: delete {:?}", &entry.path());
-                try!(wrap_io(&entry.path(),
-                             IoType::CleanupDelete,
-                             fs::remove_file(entry.path())));
+            trace!("clean: delete {:?}", &entry.path());
+            try!(wrap_io(&entry.path(),
+                         IoType::CleanupDelete,
+                         fs::remove_file(entry.path())));
         }
 
         Ok(())
@@ -1284,7 +1313,7 @@ impl Connection {
                 }
 
                 header_builder.set_highest_ever_item_id(self.highwater_object_id);
-                self.save_config((&mut header_builder).borrow().init_config());
+                self.config.save((&mut header_builder).borrow().init_config());
             }
 
             let msg_words = capnp::serialize::write_message_to_words(&msg_builder);

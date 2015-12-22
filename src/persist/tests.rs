@@ -30,7 +30,7 @@ fn open_create() {
 
 fn mkvector(count: usize, fill: u8) -> Vec<u8> {
     let mut out = Vec::new();
-    for _ in 0 .. count {
+    for _ in 0..count {
         out.push(fill);
     }
     out
@@ -44,12 +44,12 @@ fn basic_permanence() {
 
         match id {
             1 => {
-                assert_eq!(item.header(), &[100u8,0,0,0]);
+                assert_eq!(item.header(), &[100u8, 0, 0, 0]);
                 assert_eq!(pin.data(), &*mkvector(11, 0x45));
             }
             2 => {
-                assert_eq!(item.header(), &[200u8,0,0,0]);
-                assert_eq!(pin.data(), &*mkvector(1 << 20, 0x54));
+                assert_eq!(item.header(), &[200u8, 0, 0, 0]);
+                assert_eq!(pin.data(), &*mkvector(1 << 16, 0x54));
             }
             _ => {
                 panic!("shouldn't exist");
@@ -79,8 +79,10 @@ fn basic_permanence() {
         assert_eq!(con.transaction().list_items().count(), 0);
         {
             let mut tx = con.transaction();
-            assert_eq!(tx.add_item(vec![100,0,0,0], mkvector(11, 0x45)).unwrap(), 1);
-            assert_eq!(tx.add_item(vec![200,0,0,0], mkvector(1 << 20, 0x54)).unwrap(), 2);
+            assert_eq!(tx.add_item(vec![100, 0, 0, 0], mkvector(11, 0x45)).unwrap(),
+                       1);
+            assert_eq!(tx.add_item(vec![200, 0, 0, 0], mkvector(1 << 16, 0x54)).unwrap(),
+                       2);
             tx.commit().unwrap();
         }
         check_content(&mut con);
@@ -89,10 +91,19 @@ fn basic_permanence() {
     {
         let mut con = Connection::open(&*dir.path().join("blah"), false).unwrap();
         check_content(&mut con);
+        {
+            let mut tx = con.transaction();
+            tx.new_config().app_name = "Asdf".to_owned();
+            tx.commit().unwrap();
+        }
     }
 
     {
         let mut con = Connection::open(&*dir.path().join("blah"), false).unwrap();
         check_content(&mut con);
+        {
+            let mut tx = con.transaction();
+            assert_eq!(&*tx.new_config().app_name, "Asdf");
+        }
     }
 }
