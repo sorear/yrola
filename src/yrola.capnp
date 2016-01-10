@@ -81,7 +81,10 @@ struct LevelTableChange {
   created @6 :Bool; # if dropped and not created, everything else is dead
 
   keyCount @1 :UInt32;
+  matchKeys @8 :List(UInt32);
+
   columnOrder @2 :List(UInt32);
+  columnsDeleted @7 :List(UInt32);
 
   upsertData @3 :List(LevelColumn); # keys, column data
   deleteData @4 :List(LevelColumn); # just the keys

@@ -2,6 +2,7 @@ use borrow_segments::{self, BorrowSegments};
 use capnp;
 use capnp::message;
 use capnp::serialize;
+use capnp::struct_list;
 use capnp::traits::FromPointerReader;
 use persist::{self, ValueHandle, ValuePin};
 use std::cmp;
@@ -88,6 +89,11 @@ fn binary_search_index<F>(to: usize, mut f: F) -> result::Result<usize, usize>
     Err(base)
 }
 
+fn null_table_change() -> level_table_change::Reader<'static> {
+    let nullp = capnp::private::layout::PointerReader::new_default();
+    level_table_change::Reader::get_from_pointer(&nullp).unwrap()
+}
+
 impl LevelReader {
     fn get_level_ptr<'a>(&'a self) -> Result<level::Reader<'a>> {
         match self.bundle_index {
@@ -110,12 +116,72 @@ impl LevelReader {
             changed_reader.clone().get(ix as u32).get_table_id().cmp(&table_id)
         }) {
             Ok(ix) => Ok(changed_reader.clone().get(ix as u32)),
-            Err(_) => {
-                let nullp = capnp::private::layout::PointerReader::new_default();
-                Ok(try!(level_table_change::Reader::get_from_pointer(&nullp)))
-            }
+            Err(_) => Ok(null_table_change()),
         }
     }
+}
+
+fn merge_levels(fst_l: &LevelHandle, snd_l: &LevelHandle) -> Result<LevelHandle> {
+    let mut message_b = message::Builder::new_default();
+
+    {
+        let level_b = message_b.init_root::<level::Builder>();
+
+        let fst_lr = try!(fst_l.get_level_reader());
+        let fst_lp = try!(fst_lr.get_level_ptr());
+        let fst_change_r = try!(fst_lp.get_tables_changed());
+        let snd_lr = try!(snd_l.get_level_reader());
+        let snd_lp = try!(snd_lr.get_level_ptr());
+        let snd_change_r = try!(snd_lp.get_tables_changed());
+
+        try!(merge_levels_tc(level_b, fst_change_r, snd_change_r));
+    }
+
+    let words = serialize::write_message_to_words(&message_b);
+    Ok(LevelHandle {
+        bundle_index: None,
+        value: ValueHandle::new_words(&words[..]),
+    })
+}
+
+fn merge_levels_tc<'a>(out_lp: level::Builder<'a>,
+                       fst_l: struct_list::Reader<'a, level_table_change::Owned>,
+                       snd_l: struct_list::Reader<'a, level_table_change::Owned>)
+                       -> Result<()> {
+    // TODO(someday): This pass would be unneeded if we had an orphanage
+    let mut merged_count = 0;
+    {
+        let mut fst_ix = 0;
+        let mut snd_ix = 0;
+
+        loop {
+            if fst_ix == fst_l.len() {
+                merged_count += snd_l.len() - snd_ix;
+                break;
+            }
+
+            if snd_ix == snd_l.len() {
+                merged_count += fst_l.len() - fst_ix;
+                break;
+            }
+
+            let fst_tbl = fst_l.clone().get(fst_ix).get_table_id();
+            let snd_tbl = snd_l.clone().get(snd_ix).get_table_id();
+
+            if fst_tbl == cmp::min(fst_tbl, snd_tbl) {
+                fst_ix += 1;
+            }
+
+            if snd_tbl == cmp::min(fst_tbl, snd_tbl) {
+                snd_ix += 1;
+            }
+
+            merged_count += 1;
+        }
+    }
+
+    let _out_change_p = out_lp.init_tables_changed(merged_count);
+    unimplemented!()
 }
 
 impl From<capnp::Error> for Error {
@@ -226,6 +292,7 @@ impl Transaction {
         try!(self.push_uncommitted_level(&message_b));
         Ok(())
     }
+
 
     pub fn commit(self) -> Result<()> {
         unimplemented!()
