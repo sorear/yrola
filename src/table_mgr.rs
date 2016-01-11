@@ -4,6 +4,7 @@ use capnp::message;
 use capnp::serialize;
 use capnp::struct_list;
 use capnp::traits::FromPointerReader;
+use misc;
 use persist::{self, ValueHandle, ValuePin};
 use std::cmp;
 use std::cmp::Ordering;
@@ -144,44 +145,57 @@ fn merge_levels(fst_l: &LevelHandle, snd_l: &LevelHandle) -> Result<LevelHandle>
     })
 }
 
+// TODO(soon): Should capnp-rust generate this automatically?
+fn copy_table_change<'a>(mut out: level_table_change::Builder<'a>,
+                         inp: level_table_change::Reader<'a>)
+                         -> capnp::Result<()> {
+    out.set_table_id(inp.get_table_id());
+    out.set_dropped(inp.get_dropped());
+    out.set_created(inp.get_created());
+    out.set_key_count(inp.get_key_count());
+    try!(out.set_match_keys(try!(inp.get_match_keys())));
+    try!(out.set_column_order(try!(inp.get_column_order())));
+    try!(out.set_columns_deleted(try!(inp.get_columns_deleted())));
+    try!(out.set_upsert_data(try!(inp.get_upsert_data())));
+    try!(out.set_delete_data(try!(inp.get_delete_data())));
+    Ok(())
+}
+
+fn merge_levels_table<'a>(_out_t: level_table_change::Builder<'a>,
+                          _fst_t: level_table_change::Reader<'a>,
+                          _snd_t: level_table_change::Reader<'a>)
+                          -> Result<()> {
+    unimplemented!()
+}
+
 fn merge_levels_tc<'a>(out_lp: level::Builder<'a>,
                        fst_l: struct_list::Reader<'a, level_table_change::Owned>,
                        snd_l: struct_list::Reader<'a, level_table_change::Owned>)
                        -> Result<()> {
     // TODO(someday): This pass would be unneeded if we had an orphanage
-    let mut merged_count = 0;
-    {
-        let mut fst_ix = 0;
-        let mut snd_ix = 0;
+    let merged_count = misc::merge_iters(fst_l.iter(),
+                                         snd_l.iter(),
+                                         |a, b| a.get_table_id().cmp(&b.get_table_id()))
+                           .count() as u32;
 
-        loop {
-            if fst_ix == fst_l.len() {
-                merged_count += snd_l.len() - snd_ix;
-                break;
+    let mut out_changes_p = out_lp.init_tables_changed(merged_count);
+    let mut merge_ix = 0;
+
+    for align in misc::merge_iters(fst_l.iter(),
+                                   snd_l.iter(),
+                                   |a, b| a.get_table_id().cmp(&b.get_table_id())) {
+        let out_change_p = out_changes_p.borrow().get(merge_ix);
+        merge_ix += 1;
+        match align {
+            misc::MergeRow::Left(table_l) => try!(copy_table_change(out_change_p, table_l)),
+            misc::MergeRow::Right(table_r) => try!(copy_table_change(out_change_p, table_r)),
+            misc::MergeRow::Match(table_l, table_r) => {
+                try!(merge_levels_table(out_change_p, table_l, table_r));
             }
-
-            if snd_ix == snd_l.len() {
-                merged_count += fst_l.len() - fst_ix;
-                break;
-            }
-
-            let fst_tbl = fst_l.clone().get(fst_ix).get_table_id();
-            let snd_tbl = snd_l.clone().get(snd_ix).get_table_id();
-
-            if fst_tbl == cmp::min(fst_tbl, snd_tbl) {
-                fst_ix += 1;
-            }
-
-            if snd_tbl == cmp::min(fst_tbl, snd_tbl) {
-                snd_ix += 1;
-            }
-
-            merged_count += 1;
         }
     }
 
-    let _out_change_p = out_lp.init_tables_changed(merged_count);
-    unimplemented!()
+    Ok(())
 }
 
 impl From<capnp::Error> for Error {
