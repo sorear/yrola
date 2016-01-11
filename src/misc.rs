@@ -1,5 +1,6 @@
-use std::slice::{from_raw_parts, from_raw_parts_mut};
+use std::cmp::Ordering;
 use std::mem::{align_of, size_of};
+use std::slice::{from_raw_parts, from_raw_parts_mut};
 
 pub unsafe trait POD {}
 
@@ -31,13 +32,86 @@ pub fn downcast_pod_mut<T: POD>(bytes: &mut [u8]) -> &mut [T] {
 }
 
 pub fn upcast_pod<T: POD>(things: &[T]) -> &[u8] {
-    unsafe {
-        from_raw_parts(things.as_ptr() as *const u8, things.len() * size_of::<T>())
-    }
+    unsafe { from_raw_parts(things.as_ptr() as *const u8, things.len() * size_of::<T>()) }
 }
 
 pub fn upcast_pod_mut<T: POD>(things: &mut [T]) -> &mut [u8] {
-    unsafe {
-        from_raw_parts_mut(things.as_ptr() as *mut u8, things.len() * size_of::<T>())
+    unsafe { from_raw_parts_mut(things.as_ptr() as *mut u8, things.len() * size_of::<T>()) }
+}
+
+pub enum MergeRow<V1, V2> {
+    Left(V1),
+    Right(V2),
+    Match(V1, V2),
+}
+
+pub struct MergeIter<I1: Iterator, I2: Iterator, CMP> {
+    iter1: I1,
+    iter2: I2,
+    buffer1: Option<I1::Item>,
+    buffer2: Option<I2::Item>,
+    comparer: CMP,
+}
+
+impl<I1, I2, CMP> Iterator for MergeIter<I1, I2, CMP>
+    where I1: Iterator,
+          I2: Iterator,
+          CMP: FnMut(&I1::Item, &I2::Item) -> Ordering
+{
+    type Item = MergeRow<I1::Item, I2::Item>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let v1 = self.buffer1.take();
+        let v2 = self.buffer2.take();
+
+        match (v1, v2) {
+            (None, None) => None,
+            (Some(x), None) => {
+                self.buffer1 = self.iter1.next();
+                Some(MergeRow::Left(x))
+            }
+            (None, Some(x)) => {
+                self.buffer2 = self.iter2.next();
+                Some(MergeRow::Right(x))
+            }
+            (Some(x), Some(y)) => {
+                match (self.comparer)(&x, &y) {
+                    Ordering::Equal => {
+                        self.buffer1 = self.iter1.next();
+                        self.buffer2 = self.iter2.next();
+                        Some(MergeRow::Match(x, y))
+                    }
+                    Ordering::Less => {
+                        self.buffer1 = self.iter1.next();
+                        self.buffer2 = Some(y);
+                        Some(MergeRow::Left(x))
+                    }
+                    Ordering::Greater => {
+                        self.buffer2 = self.iter2.next();
+                        self.buffer1 = Some(x);
+                        Some(MergeRow::Right(y))
+                    }
+                }
+            }
+        }
+    }
+}
+
+pub fn merge_iters<I1, I2, CMP>(mut iter1: I1,
+                                mut iter2: I2,
+                                comparer: CMP)
+                                -> MergeIter<I1, I2, CMP>
+    where I1: Iterator,
+          I2: Iterator,
+          CMP: FnMut(&I1::Item, &I2::Item) -> Ordering
+{
+    let buffer1 = iter1.next();
+    let buffer2 = iter2.next();
+    MergeIter {
+        iter1: iter1,
+        iter2: iter2,
+        buffer1: buffer1,
+        buffer2: buffer2,
+        comparer: comparer,
     }
 }
