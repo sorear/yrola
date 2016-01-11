@@ -13,9 +13,8 @@ use persist::{ValueHandle,ValuePin};
 use std::sync::Arc;
 use std::ops::Range;
 use std::result;
-use misc::downcast_pod;
 use std::borrow::Cow;
-use byteorder::{NativeEndian, ByteOrder};
+use byteorder::{BigEndian, ByteOrder};
 
 // bucket for uninterpreted bytes
 enum Span {
@@ -54,9 +53,15 @@ impl Fragment {
         match self.repr {
             Representation::Fixed(len) => Some(Cow::Borrowed(&self.spans[0].data()[index * len .. (index + 1) * len ])),
             Representation::Blob32 => {
-                let offsets = downcast_pod::<u32>(self.spans[0].data());
+                let offsets_b = self.spans[0].data();
                 let bytes = self.spans[1].data();
-                Some(Cow::Borrowed(&bytes[offsets[index] as usize .. offsets[index + 1] as usize]))
+                let offset = BigEndian::read_u32(&offsets_b[index*4 .. (index+1)*4]) as usize;
+                let offset_next = BigEndian::read_u32(&offsets_b[(index+1)*4 .. (index+2)*4]) as usize;
+                if (offset & 1) == 1 {
+                    None
+                } else {
+                    Some(Cow::Borrowed(&bytes[(offset >> 1) .. (offset_next >> 1)]))
+                }
             }
         }
     }
@@ -137,16 +142,26 @@ impl ColumnBuilder {
     }
 
     fn push_any_copy<'a,'b>(&'a mut self, data: Option<Cow<'b,[u8]>>) {
-        let cow = data.unwrap(); // TODO(soon): implement nullblobs
         let mut lenb = [0u8; 4];
-        NativeEndian::write_u32(&mut lenb, self.spans[1].len() as u32);
+        let mut coded_len = (self.spans[1].len() as u32) << 1;
+
+        match data {
+            Some(dptr) => {
+                self.spans[1].extend(&*dptr);
+                assert!(self.spans[1].len() < (1 << 31));
+            }
+            None => {
+                coded_len += 1;
+            }
+        }
+
+        BigEndian::write_u32(&mut lenb, coded_len);
         self.spans[0].extend(&lenb);
-        self.spans[1].extend(&*cow);
     }
 
     fn close(mut self) -> Column {
         let mut lenb = [0u8; 4];
-        NativeEndian::write_u32(&mut lenb, self.spans[1].len() as u32);
+        BigEndian::write_u32(&mut lenb, (self.spans[1].len() as u32) << 1);
         let els = self.spans[0].len();
         self.spans[0].extend(&lenb);
 
