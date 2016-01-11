@@ -3,11 +3,11 @@ use capnp;
 use capnp::message;
 use capnp::serialize;
 use capnp::struct_list;
-use capnp::traits::FromPointerReader;
+use capnp::traits::{FromPointerReader, IndexMove};
 use misc;
 use persist::{self, ValueHandle, ValuePin};
 use std::cmp;
-use std::cmp::Ordering;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::result;
 use std::sync::Mutex;
@@ -41,6 +41,7 @@ pub struct TableMetadata {
     exists: bool,
 }
 
+// TODO(soon): cleverly factor
 pub enum Error {
     Persist(persist::Error),
     Capnp(capnp::Error),
@@ -49,6 +50,14 @@ pub enum Error {
     WrongApp(String),
     NoSuchTable(u64),
     TableIdsExhausted,
+    MergePkeyMismatch(u64, u32, u32),
+    // TODO(soon): need a way to identify levels
+    // TODO(soon): merge does not own this logic
+    MergeDupDelCol(u64, u32),
+    MergeDupInsCol(u64, u32),
+    MergeDelNotIns(u64, u32),
+    MergeDelNotMatched(u64, u32),
+    WrongVecLen,
 }
 
 pub type Result<T> = result::Result<T, Error>;
@@ -66,28 +75,6 @@ impl LevelHandle {
             bundle_index: self.bundle_index,
         })
     }
-}
-
-// hacked from the slice version in libcore
-fn binary_search_index<F>(to: usize, mut f: F) -> result::Result<usize, usize>
-    where F: FnMut(usize) -> Ordering
-{
-    let mut base: usize = 0;
-    let mut lim: usize = to;
-
-    while lim != 0 {
-        let ix = base + (lim >> 1);
-        match f(ix) {
-            Ordering::Equal => return Ok(ix),
-            Ordering::Less => {
-                base = ix + 1;
-                lim -= 1;
-            }
-            Ordering::Greater => (),
-        }
-        lim >>= 1;
-    }
-    Err(base)
 }
 
 fn null_table_change() -> level_table_change::Reader<'static> {
@@ -113,7 +100,7 @@ impl LevelReader {
     fn get_table_ptr<'a>(&'a self, table_id: u64) -> Result<level_table_change::Reader<'a>> {
         let level_reader = try!(self.get_level_ptr());
         let changed_reader = try!(level_reader.get_tables_changed());
-        match binary_search_index(changed_reader.len() as usize, |ix| {
+        match misc::binary_search_index(changed_reader.len() as usize, |ix| {
             changed_reader.clone().get(ix as u32).get_table_id().cmp(&table_id)
         }) {
             Ok(ix) => Ok(changed_reader.clone().get(ix as u32)),
@@ -161,10 +148,123 @@ fn copy_table_change<'a>(mut out: level_table_change::Builder<'a>,
     Ok(())
 }
 
-fn merge_levels_table<'a>(_out_t: level_table_change::Builder<'a>,
-                          _fst_t: level_table_change::Reader<'a>,
-                          _snd_t: level_table_change::Reader<'a>)
+fn merge_levels_table<'a>(mut out_t: level_table_change::Builder<'a>,
+                          fst_t: level_table_change::Reader<'a>,
+                          snd_t: level_table_change::Reader<'a>)
                           -> Result<()> {
+    if snd_t.get_dropped() {
+        // it's absolute...
+        try!(copy_table_change(out_t, snd_t));
+        return Ok(());
+    }
+
+    if !snd_t.get_created() {
+        // no update?  shouldn't really happen
+        try!(copy_table_change(out_t, fst_t));
+        return Ok(());
+    }
+
+    // snd is now known to be created & !dropped
+
+    if !fst_t.get_created() {
+        // starting from blankness
+        try!(copy_table_change(out_t.borrow(), snd_t));
+        out_t.set_dropped(fst_t.get_dropped());
+        return Ok(());
+    }
+
+    // at this point we are known to be merging creates
+    out_t.set_dropped(fst_t.get_dropped());
+    out_t.set_created(true);
+    out_t.set_table_id(fst_t.get_table_id());
+    out_t.set_key_count(1);
+
+    let nkeys = 1;
+    let table_id = fst_t.get_table_id();
+    if fst_t.get_key_count() != 1 || snd_t.get_key_count() != 1 {
+        unimplemented!();
+    }
+
+    if fst_t.has_match_keys() || snd_t.has_match_keys() {
+        // this is for upserts to secondary indices...note that the secondary index design is
+        // kinda meh since it should be packed
+        unimplemented!();
+    }
+
+    let fst_co = try!(fst_t.get_column_order());
+    let snd_co = try!(snd_t.get_column_order());
+    let fst_cd = try!(fst_t.get_columns_deleted());
+    let snd_cd = try!(snd_t.get_columns_deleted());
+    let fst_ud = try!(fst_t.get_upsert_data());
+    let snd_ud = try!(snd_t.get_upsert_data());
+    let fst_dd = try!(fst_t.get_delete_data());
+    let snd_dd = try!(snd_t.get_delete_data());
+
+    if fst_ud.len() != nkeys + fst_co.len() {
+        return Err(Error::WrongVecLen);
+    }
+
+    if fst_dd.len() != nkeys {
+        return Err(Error::WrongVecLen);
+    }
+
+    if snd_ud.len() != nkeys + snd_co.len() {
+        return Err(Error::WrongVecLen);
+    }
+
+    if snd_dd.len() != nkeys {
+        return Err(Error::WrongVecLen);
+    }
+
+    let mut col_del_set = HashSet::new();
+    let mut col_left_data = HashMap::new();
+    let mut col_right_data = HashMap::new();
+    let mut stale_col = HashSet::new();
+
+    for (colix, colid) in misc::prim_list_iter(fst_co).enumerate() {
+        if col_left_data.insert(colid, fst_ud.index_move(colix as u32 + nkeys)).is_some() {
+            return Err(Error::MergeDupDelCol(table_id, colid));
+        }
+        stale_col.insert(colid);
+    }
+
+    for delid in misc::prim_list_iter(fst_cd) {
+        if !col_left_data.contains_key(&delid) {
+            return Err(Error::MergeDelNotIns(table_id, delid));
+        }
+        if col_del_set.insert(delid) {
+            return Err(Error::MergeDupInsCol(table_id, delid));
+        }
+    }
+
+    // TODO(now): need to add column default value data to the column order so that we can
+    // appropriately materialize the new columns
+    for (colix, colid) in misc::prim_list_iter(snd_co).enumerate() {
+        if col_right_data.insert(colid, fst_ud.index_move(colix as u32 + nkeys)).is_some() {
+            return Err(Error::MergeDupInsCol(table_id, colid));
+        }
+        if col_left_data.contains_key(&colid) {
+            stale_col.remove(&colid);
+        } else {
+            col_left_data.insert(colid, unimplemented!());
+        }
+    }
+
+    for colid in stale_col {
+        col_left_data.remove(&colid);
+        col_del_set.remove(&colid);
+    }
+
+    assert!(col_left_data.keys().eq(col_right_data.keys()));
+
+    for delid in misc::prim_list_iter(snd_cd) {
+        if !col_left_data.contains_key(&delid) {
+            return Err(Error::MergeDelNotMatched(table_id, delid));
+        }
+        col_del_set.insert(delid);
+        col_left_data.insert(delid, unimplemented!());
+    }
+
     unimplemented!()
 }
 

@@ -82,6 +82,8 @@ struct LevelTableChange {
 
   keyCount @1 :UInt32;
   matchKeys @8 :List(UInt32);
+  # subset of key columns on which uniqueness is enforced.  optimization for
+  # secondary index upserts
 
   columnOrder @2 :List(UInt32);
   columnsDeleted @7 :List(UInt32);
@@ -90,6 +92,10 @@ struct LevelTableChange {
   deleteData @4 :List(LevelColumn); # just the keys
 
   # TODO (soon): Timeout columns for snapshot isolation
+  # we'll store a general write stamp, a schema write stamp, and individual
+  # write stamps per pk.  or, we can use the fast-forward data; will probably
+  # aggressively retire the timestamp data, and use ff data if a very old tx
+  # dares to commit
 }
 
 struct LevelColumn {

@@ -1,3 +1,4 @@
+use capnp;
 use std::cmp::Ordering;
 use std::mem::{align_of, size_of};
 use std::slice::{from_raw_parts, from_raw_parts_mut};
@@ -113,5 +114,56 @@ pub fn merge_iters<I1, I2, CMP>(mut iter1: I1,
         buffer1: buffer1,
         buffer2: buffer2,
         comparer: comparer,
+    }
+}
+
+// hacked from the slice version in libcore
+pub fn binary_search_index<F>(to: usize, mut f: F) -> Result<usize, usize>
+    where F: FnMut(usize) -> Ordering
+{
+    let mut base: usize = 0;
+    let mut lim: usize = to;
+
+    while lim != 0 {
+        let ix = base + (lim >> 1);
+        match f(ix) {
+            Ordering::Equal => return Ok(ix),
+            Ordering::Less => {
+                base = ix + 1;
+                lim -= 1;
+            }
+            Ordering::Greater => (),
+        }
+        lim >>= 1;
+    }
+    Err(base)
+}
+
+pub struct PrimitiveListIter<'a, T: capnp::private::layout::PrimitiveElement> {
+    reader: capnp::primitive_list::Reader<'a, T>,
+    index: u32,
+}
+
+impl<'a, T: capnp::private::layout::PrimitiveElement> Iterator for PrimitiveListIter<'a, T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.index >= self.reader.len() {
+            None
+        } else {
+            let value = self.reader.get(self.index);
+            self.index += 1;
+            Some(value)
+        }
+    }
+}
+
+pub fn prim_list_iter<'a, T>(reader: capnp::primitive_list::Reader<'a, T>)
+                             -> PrimitiveListIter<'a, T>
+    where T: capnp::private::layout::PrimitiveElement
+{
+    PrimitiveListIter {
+        reader: reader,
+        index: 0,
     }
 }
