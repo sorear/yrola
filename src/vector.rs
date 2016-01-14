@@ -9,13 +9,14 @@
 // Describing a vector requires a global type/representation, a list of segment lengths, and some
 // additional data for each segment...
 
-use persist::{ValueHandle, ValuePin};
-use std::sync::Arc;
-use std::ops::Range;
-use std::result;
-use std::borrow::Cow;
 use byteorder::{BigEndian, ByteOrder};
 use misc;
+use persist::ValuePin;
+use std::borrow::Cow;
+use std::ops::Range;
+use std::result;
+use std::sync::Arc;
+use std::u32;
 
 // bucket for uninterpreted bytes
 enum Span {
@@ -187,15 +188,121 @@ impl ColumnBuilder {
 // TODO(soon): details, factoring
 pub enum Error {
     WrongLength,
+    MalformedData,
 }
 pub type Result<T> = result::Result<T, Error>;
 
-pub fn parse(_handle: ValueHandle, _range: Range<usize>) -> Result<Column> {
-    unimplemented!()
+fn peel_range<'a>(range: &mut &'a [u8], count: usize) -> Result<&'a [u8]> {
+    if range.len() >= count {
+        let (take, rest) = range.split_at(count);
+        *range = rest;
+        Ok(take)
+    } else {
+        Err(Error::MalformedData)
+    }
 }
 
-pub fn serialized_size(_col: &Column) -> u64 {
-    unimplemented!()
+fn peel_u32(range: &mut &[u8]) -> Result<u32> {
+    Ok(BigEndian::read_u32(try!(peel_range(range, 4))))
+}
+
+fn put_u32(out: &mut Vec<u8>, value: u32) {
+    let mut buf = [0u8; 4];
+    BigEndian::write_u32(&mut buf, value);
+    out.extend(&buf);
+}
+
+// needs refactoring badly
+pub fn parse(pin: ValuePin, mut range: &[u8]) -> Result<Column> {
+    if misc::slice_unindex(pin.data(), range).is_none() {
+        // should cover all unwraps below
+        return Err(Error::MalformedData);
+    }
+
+    let mut frags = Vec::new();
+
+    for _frag_ix in 0 .. try!(peel_u32(&mut range)) {
+        let repcode = try!(peel_u32(&mut range));
+        match repcode {
+            1 => {
+                let count = try!(peel_u32(&mut range));
+                let stride = try!(peel_u32(&mut range));
+                let bytes = try!(count.checked_mul(stride).ok_or(Error::MalformedData));
+                let data = try!(peel_range(&mut range, bytes as usize));
+                let data_r = misc::slice_unindex(pin.data(), data).unwrap();
+                frags.push(Fragment {
+                    repr: Representation::Fixed(stride as usize),
+                    length: count as usize,
+                    spans: vec![
+                        Span::Persist { handle: pin.clone(), range: data_r },
+                    ]
+                });
+            },
+
+            2 => {
+                let count = try!(peel_u32(&mut range));
+                let bytes = try!(peel_u32(&mut range));
+                let count_p1 = try!(count.checked_add(1).ok_or(Error::MalformedData));
+                let count_bytes = try!(count_p1.checked_mul(4).ok_or(Error::MalformedData));
+                let pointers = try!(peel_range(&mut range, count_bytes as usize));
+                let pointers_r = misc::slice_unindex(pin.data(), pointers).unwrap();
+                let data = try!(peel_range(&mut range, bytes as usize));
+                let data_r = misc::slice_unindex(pin.data(), data).unwrap();
+
+                frags.push(Fragment {
+                    repr: Representation::Blob32,
+                    length: count as usize,
+                    spans: vec![
+                        Span::Persist { handle: pin.clone(), range: pointers_r },
+                        Span::Persist { handle: pin.clone(), range: data_r },
+                    ]
+                });
+            }
+
+            _ => {
+                return Err(Error::MalformedData);
+            }
+        }
+    }
+
+    return Ok(Column(Arc::new(ColData { fragments: frags })));
+}
+
+pub fn serialized(col: &Column) -> Result<Vec<u8>> {
+    macro_rules! check_size {
+        ($x:expr) => {{
+            let val: usize = $x;
+            if val > u32::MAX as usize {
+                return Err(Error::MalformedData);
+            }
+            val as u32
+        }}
+    }
+
+    let mut out = Vec::new();
+    let frags = &col.0.fragments;
+
+    put_u32(&mut out, check_size!(frags.len()));
+    for frag in frags {
+        match frag.repr {
+            Representation::Blob32 => {
+                put_u32(&mut out, check_size!(frag.length));
+                let offsets_sp = frag.spans[0].data();
+                let bytes_sp = frag.spans[1].data();
+                let last_offset = BigEndian::read_u32(&offsets_sp[frag.length * 4..(frag.length + 1) * 4]);
+                put_u32(&mut out, last_offset);
+                out.extend(offsets_sp);
+                out.extend(bytes_sp);
+            }
+            Representation::Fixed(i) => {
+                put_u32(&mut out, check_size!(frag.length));
+                put_u32(&mut out, check_size!(i));
+                out.extend(frag.spans[0].data());
+            }
+        }
+    }
+
+    Ok(out)
 }
 
 pub fn sorted_semijoin(key_col: &Column,
