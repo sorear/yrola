@@ -7,7 +7,7 @@ use capnp::traits::FromPointerReader;
 use misc;
 use persist::{self, ValueHandle, ValuePin};
 use std::cmp;
-use std::collections::HashMap;
+use std::collections::{HashSet, HashMap};
 use std::path::Path;
 use std::result;
 use std::sync::Mutex;
@@ -19,6 +19,7 @@ use yrola_capnp::{level, bundle, level_table_change};
 #[derive(Clone)]
 struct LevelHandle {
     value: ValueHandle,
+    merge_count: i32,
     bundle_index: Option<u32>,
 }
 
@@ -137,6 +138,7 @@ fn merge_levels(fst_l: &LevelHandle, snd_l: &LevelHandle) -> Result<LevelHandle>
     let words = serialize::write_message_to_words(&message_b);
     Ok(LevelHandle {
         bundle_index: None,
+        merge_count: 1 + cmp::max(fst_l.merge_count, snd_l.merge_count),
         value: ValueHandle::new_words(&words[..]),
     })
 }
@@ -172,12 +174,18 @@ struct MergeTableInfo {
 }
 
 fn parse_merge_table<'a>(pin: &ValuePin,
-                         ltcr: level_table_change::Reader<'a>)
+                         ltcr: level_table_change::Reader<'a>,
+                         filter: Option<&HashSet<u32>>)
                          -> Result<MergeTableInfo> {
     let mut columns = HashMap::new();
     for lcolr in try!(ltcr.get_upsert_data()).iter() {
         if columns.contains_key(&lcolr.get_low_id()) {
             return Err(Error::MergeDupCol(ltcr.get_table_id(), lcolr.get_low_id()));
+        }
+        if let Some(filter_h) = filter {
+            if filter_h.contains(&lcolr.get_low_id()) {
+                continue;
+            }
         }
         let deflt = if lcolr.has_default() {
             Some(Vec::from(try!(lcolr.get_default())))
@@ -219,40 +227,7 @@ fn parse_merge_table<'a>(pin: &ValuePin,
     })
 }
 
-fn merge_levels_table<'a>(mut out_t: level_table_change::Builder<'a>,
-                          fst_pin: &ValuePin,
-                          fst_t: level_table_change::Reader<'a>,
-                          snd_pin: &ValuePin,
-                          snd_t: level_table_change::Reader<'a>)
-                          -> Result<()> {
-    if snd_t.get_dropped() {
-        // it's absolute...
-        try!(copy_table_change(out_t, snd_t));
-        return Ok(());
-    }
-
-    if !snd_t.get_created() {
-        // no update?  shouldn't really happen
-        try!(copy_table_change(out_t, fst_t));
-        return Ok(());
-    }
-
-    // snd is now known to be created & !dropped
-
-    if !fst_t.get_created() {
-        return Err(Error::MergeUpdateNotExists);
-    }
-
-    // at this point we are known to be merging creates
-    out_t.set_dropped(fst_t.get_dropped());
-    out_t.set_created(true);
-    out_t.set_table_id(fst_t.get_table_id());
-
-    let p1 = try!(parse_merge_table(fst_pin, fst_t));
-    let p2 = try!(parse_merge_table(snd_pin, snd_t));
-
-    // try to align the two column sets
-
+fn merge_table_view(p1: MergeTableInfo, p2: MergeTableInfo) -> Result<MergeTableInfo> {
     let mut alignment: Vec<(u32, Option<Option<Vec<u8>>>, Column, Column)> = Vec::new();
 
     for col2 in p2.columns.values() {
@@ -295,6 +270,8 @@ fn merge_levels_table<'a>(mut out_t: level_table_change::Builder<'a>,
     let new_ups = try!(vector::sorted_merge((&filtered_left[0], &p2.keys[0].upsert_key),
                                             &*ups_ref));
 
+    // TODO(someday): Can we ever annihilate deletes?
+
     let new_keys = vec![
         MergePkInfo {
             upsert_key: new_ups[0].clone(), delete_key: new_del[0].clone(), exclude_match: false
@@ -310,9 +287,51 @@ fn merge_levels_table<'a>(mut out_t: level_table_change::Builder<'a>,
                                    }
                                });
 
+    Ok(MergeTableInfo {
+        table_id: p1.table_id,
+        keys: new_keys,
+        columns: new_columns.into_iter().map(|mci| (mci.low_id, mci)).collect(),
+    })
+}
+
+fn merge_levels_table<'a>(mut out_t: level_table_change::Builder<'a>,
+                          fst_pin: &ValuePin,
+                          fst_t: level_table_change::Reader<'a>,
+                          snd_pin: &ValuePin,
+                          snd_t: level_table_change::Reader<'a>)
+                          -> Result<()> {
+    if snd_t.get_dropped() {
+        // it's absolute...
+        try!(copy_table_change(out_t, snd_t));
+        return Ok(());
+    }
+
+    if !snd_t.get_created() {
+        // no update?  shouldn't really happen
+        try!(copy_table_change(out_t, fst_t));
+        return Ok(());
+    }
+
+    // snd is now known to be created & !dropped
+
+    if !fst_t.get_created() {
+        return Err(Error::MergeUpdateNotExists);
+    }
+
+    // at this point we are known to be merging creates
+    out_t.set_dropped(fst_t.get_dropped());
+    out_t.set_created(true);
+    out_t.set_table_id(fst_t.get_table_id());
+
+    let p1 = try!(parse_merge_table(fst_pin, fst_t, None));
+    let p2 = try!(parse_merge_table(snd_pin, snd_t, None));
+
+    let p12 = try!(merge_table_view(p1, p2));
+    // try to align the two column sets
+
     {
-        let mut pkey_w = out_t.borrow().init_primary_keys(new_keys.len() as u32);
-        for (pkey_ix, pkeyi) in new_keys.into_iter().enumerate() {
+        let mut pkey_w = out_t.borrow().init_primary_keys(p12.keys.len() as u32);
+        for (pkey_ix, pkeyi) in p12.keys.into_iter().enumerate() {
             let mut pkeyi_w = pkey_w.borrow().get(pkey_ix as u32);
             pkeyi_w.set_exclude_from_match(pkeyi.exclude_match);
             let seru = try!(vector::serialized(&pkeyi.upsert_key));
@@ -323,8 +342,8 @@ fn merge_levels_table<'a>(mut out_t: level_table_change::Builder<'a>,
     }
 
     {
-        let mut cols_w = out_t.borrow().init_upsert_data(new_columns.len() as u32);
-        for (cols_ix, coli) in new_columns.into_iter().enumerate() {
+        let mut cols_w = out_t.borrow().init_upsert_data(p12.columns.len() as u32);
+        for (cols_ix, (_, coli)) in p12.columns.into_iter().enumerate() {
             let mut coli_w = cols_w.borrow().get(cols_ix as u32);
             coli_w.set_low_id(coli.low_id);
             if let Some(er) = coli.erase {
@@ -401,9 +420,10 @@ macro_rules! for_level {
 }
 
 macro_rules! for_table {
-    ($self_:expr, $table_id:expr, $id:ident in $block:block) => {
+    ($self_:expr, $table_id:expr, $pinid:ident, $id:ident in $block:block) => {
         for_level!($self_, level_r in {
             let $id = try!(level_r.get_table_ptr($table_id));
+            let $pinid = &level_r.pin;
             if $id.get_created() {
                 $block
             }
@@ -427,10 +447,27 @@ impl Transaction {
     }
 
     fn table_exists(&self, table_id: u64) -> Result<bool> {
-        for_table!(self, table_id, level_r in {
+        for_table!(self, table_id, _level_pin, table_r in {
             return Ok(true);
         });
         return Ok(false);
+    }
+
+    fn materialize(&self, table_id: u64, cols: &HashSet<u32>) -> Result<MergeTableInfo> {
+        let mut layers = Vec::new();
+        for_table!(self, table_id, level_pin, table_r in {
+            layers.push(try!(parse_merge_table(level_pin, table_r, Some(cols))));
+        });
+        while layers.len() >= 2 {
+            let bos = layers.pop().unwrap();
+            let nbos = layers.pop().unwrap();
+            layers.push(try!(merge_table_view(bos, nbos)));
+        }
+        if layers.is_empty() {
+            return Err(Error::NoSuchTable(table_id));
+        } else {
+            return Ok(layers.pop().unwrap());
+        }
     }
 
     fn push_uncommitted_level(&mut self,
@@ -439,9 +476,17 @@ impl Transaction {
         let words = serialize::write_message_to_words(&message_b);
         self.uncommitted.push(LevelHandle {
             bundle_index: None,
+            merge_count: 0,
             value: ValueHandle::new_words(&words[..]),
         });
-        // TODO(soon): compaction
+        let unc_len = self.uncommitted.len();
+        if unc_len >= 2 &&
+           self.uncommitted[unc_len - 1].merge_count >= self.uncommitted[unc_len - 2].merge_count {
+            let tos = self.uncommitted.pop().unwrap();
+            let ntos = self.uncommitted.pop().unwrap();
+            // compaction
+            self.uncommitted.push(try!(merge_levels(&ntos, &tos)));
+        }
         Ok(())
     }
 
