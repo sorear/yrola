@@ -77,19 +77,11 @@ struct Bundle {
 # creates table, asserts appropriate column orders
 struct LevelTableChange {
   tableId @0 :UInt64;
-  dropped @5 :Bool;
-  created @6 :Bool; # if dropped and not created, everything else is dead
+  dropped @1 :Bool;
+  created @2 :Bool; # if dropped and not created, everything else is dead
 
-  keyCount @1 :UInt32;
-  matchKeys @8 :List(UInt32);
-  # subset of key columns on which uniqueness is enforced.  optimization for
-  # secondary index upserts
-
-  columnOrder @2 :List(UInt32);
-  columnsDeleted @7 :List(UInt32);
-
-  upsertData @3 :List(LevelColumn); # keys, column data
-  deleteData @4 :List(LevelColumn); # just the keys
+  primaryKeys @3 :List(LevelPk);
+  upsertData @4 :List(LevelColumn);
 
   # TODO (soon): Timeout columns for snapshot isolation
   # we'll store a general write stamp, a schema write stamp, and individual
@@ -98,8 +90,17 @@ struct LevelTableChange {
   # dares to commit
 }
 
+struct LevelPk {
+  upsertBits @0 :Data;
+  deleteBits @1 :Data;
+  excludeFromMatch @2 :Bool;
+}
+
 struct LevelColumn {
-  bits @0 :Data;
+  lowId @3 :UInt32;
+  default @0 :Data;
+  erased @1 :Bool;
+  data @2 :Data;
 }
 
 # Schemas

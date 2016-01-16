@@ -84,6 +84,7 @@ struct ColData {
     fragments: Vec<Fragment>,
 }
 
+#[derive(Clone)]
 pub struct Column(Arc<ColData>);
 
 // TODO(soon): ColumnIter and ColumnBuilder are a mess
@@ -97,7 +98,7 @@ impl Column {
         self.0.fragments[frag_ix].index_any(index)
     }
 
-    fn len(&self) -> usize {
+    pub fn len(&self) -> usize {
         let mut sum = 0;
         for frag in &self.0.fragments {
             sum += frag.length;
@@ -221,7 +222,7 @@ pub fn parse(pin: ValuePin, mut range: &[u8]) -> Result<Column> {
 
     let mut frags = Vec::new();
 
-    for _frag_ix in 0 .. try!(peel_u32(&mut range)) {
+    for _frag_ix in 0..try!(peel_u32(&mut range)) {
         let repcode = try!(peel_u32(&mut range));
         match repcode {
             1 => {
@@ -235,9 +236,9 @@ pub fn parse(pin: ValuePin, mut range: &[u8]) -> Result<Column> {
                     length: count as usize,
                     spans: vec![
                         Span::Persist { handle: pin.clone(), range: data_r },
-                    ]
+                    ],
                 });
-            },
+            }
 
             2 => {
                 let count = try!(peel_u32(&mut range));
@@ -255,7 +256,7 @@ pub fn parse(pin: ValuePin, mut range: &[u8]) -> Result<Column> {
                     spans: vec![
                         Span::Persist { handle: pin.clone(), range: pointers_r },
                         Span::Persist { handle: pin.clone(), range: data_r },
-                    ]
+                    ],
                 });
             }
 
@@ -289,7 +290,9 @@ pub fn serialized(col: &Column) -> Result<Vec<u8>> {
                 put_u32(&mut out, check_size!(frag.length));
                 let offsets_sp = frag.spans[0].data();
                 let bytes_sp = frag.spans[1].data();
-                let last_offset = BigEndian::read_u32(&offsets_sp[frag.length * 4..(frag.length + 1) * 4]);
+                let last_offset = BigEndian::read_u32(&offsets_sp[frag.length * 4..(frag.length +
+                                                                                    1) *
+                                                                                   4]);
                 put_u32(&mut out, last_offset);
                 out.extend(offsets_sp);
                 out.extend(bytes_sp);
@@ -368,4 +371,13 @@ pub fn sorted_merge(key_cols: (&Column, &Column),
     }
 
     Ok(per_data_col.into_iter().map(|(_, _, b)| b.close()).collect())
+}
+
+pub fn constant(value: Option<Vec<u8>>, count: usize) -> Result<Column> {
+    let mut builder = ColumnBuilder::new();
+    let vref = value.as_ref().map(|v| &**v);
+    for _ in 0..count {
+        builder.push_any_copy(vref.map(Cow::Borrowed));
+    }
+    Ok(builder.close())
 }

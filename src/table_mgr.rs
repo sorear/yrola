@@ -3,15 +3,16 @@ use capnp;
 use capnp::message;
 use capnp::serialize;
 use capnp::struct_list;
-use capnp::traits::{FromPointerReader, IndexMove};
+use capnp::traits::FromPointerReader;
 use misc;
 use persist::{self, ValueHandle, ValuePin};
 use std::cmp;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::result;
 use std::sync::Mutex;
 use std::u64;
+use vector::{self, Column};
 use yrola_capnp::{level, bundle, level_table_change};
 
 // a levelhandle does NOT know its own place...
@@ -22,6 +23,7 @@ struct LevelHandle {
 }
 
 struct LevelReader {
+    pin: ValuePin,
     reader: message::Reader<BorrowSegments<ValuePin>>,
     bundle_index: Option<u32>,
 }
@@ -33,9 +35,7 @@ pub struct Transaction {
 }
 
 #[derive(Default)]
-pub struct TableCreateOptions {
-    key_count: u32,
-}
+pub struct TableCreateOptions;
 
 pub struct TableMetadata {
     exists: bool,
@@ -45,6 +45,7 @@ pub struct TableMetadata {
 pub enum Error {
     Persist(persist::Error),
     Capnp(capnp::Error),
+    Vector(vector::Error),
     DbTooOld(u32),
     DbTooNew(u32),
     WrongApp(String),
@@ -53,11 +54,14 @@ pub enum Error {
     MergePkeyMismatch(u64, u32, u32),
     // TODO(soon): need a way to identify levels
     // TODO(soon): merge does not own this logic
+    MergeDupCol(u64, u32),
     MergeDupDelCol(u64, u32),
     MergeDupInsCol(u64, u32),
     MergeDelNotIns(u64, u32),
     MergeDelNotMatched(u64, u32),
     WrongVecLen,
+    MergeUpdateNotExists,
+    MergeUpdateColNotExists,
 }
 
 pub type Result<T> = result::Result<T, Error>;
@@ -70,6 +74,7 @@ impl LevelHandle {
     fn get_level_reader(&self) -> Result<LevelReader> {
         let pin = try!(self.value.pin());
         Ok(LevelReader {
+            pin: pin.clone(),
             reader: try!(borrow_segments::read_message_from_owner(pin,
                                                                   message::ReaderOptions::new())),
             bundle_index: self.bundle_index,
@@ -122,7 +127,11 @@ fn merge_levels(fst_l: &LevelHandle, snd_l: &LevelHandle) -> Result<LevelHandle>
         let snd_lp = try!(snd_lr.get_level_ptr());
         let snd_change_r = try!(snd_lp.get_tables_changed());
 
-        try!(merge_levels_tc(level_b, fst_change_r, snd_change_r));
+        try!(merge_levels_tc(level_b,
+                             &fst_lr.pin,
+                             fst_change_r,
+                             &snd_lr.pin,
+                             snd_change_r));
     }
 
     let words = serialize::write_message_to_words(&message_b);
@@ -139,17 +148,81 @@ fn copy_table_change<'a>(mut out: level_table_change::Builder<'a>,
     out.set_table_id(inp.get_table_id());
     out.set_dropped(inp.get_dropped());
     out.set_created(inp.get_created());
-    out.set_key_count(inp.get_key_count());
-    try!(out.set_match_keys(try!(inp.get_match_keys())));
-    try!(out.set_column_order(try!(inp.get_column_order())));
-    try!(out.set_columns_deleted(try!(inp.get_columns_deleted())));
+    try!(out.set_primary_keys(try!(inp.get_primary_keys())));
     try!(out.set_upsert_data(try!(inp.get_upsert_data())));
-    try!(out.set_delete_data(try!(inp.get_delete_data())));
     Ok(())
 }
 
+struct MergeColumnInfo {
+    low_id: u32,
+    erase: Option<Option<Vec<u8>>>,
+    data: Column,
+}
+
+struct MergePkInfo {
+    upsert_key: Column,
+    delete_key: Column,
+    exclude_match: bool,
+}
+
+struct MergeTableInfo {
+    table_id: u64,
+    keys: Vec<MergePkInfo>,
+    columns: HashMap<u32, MergeColumnInfo>,
+}
+
+fn parse_merge_table<'a>(pin: &ValuePin,
+                         ltcr: level_table_change::Reader<'a>)
+                         -> Result<MergeTableInfo> {
+    let mut columns = HashMap::new();
+    for lcolr in try!(ltcr.get_upsert_data()).iter() {
+        if columns.contains_key(&lcolr.get_low_id()) {
+            return Err(Error::MergeDupCol(ltcr.get_table_id(), lcolr.get_low_id()));
+        }
+        let deflt = if lcolr.has_default() {
+            Some(Vec::from(try!(lcolr.get_default())))
+        } else {
+            None
+        };
+        let erase = if lcolr.get_erased() {
+            Some(deflt)
+        } else {
+            None
+        };
+        columns.insert(lcolr.get_low_id(),
+                       MergeColumnInfo {
+                           low_id: lcolr.get_low_id(),
+                           erase: erase,
+                           data: try!(vector::parse(pin.clone(), try!(lcolr.get_data()))),
+                       });
+    }
+
+    let pkinfo: Vec<_> = try!(try!(ltcr.get_primary_keys())
+                                  .iter()
+                                  .map(|kr| {
+                                      Ok::<_, Error>(MergePkInfo {
+            upsert_key: try!(vector::parse(pin.clone(), try!(kr.get_upsert_bits()))),
+            delete_key: try!(vector::parse(pin.clone(), try!(kr.get_delete_bits()))),
+            exclude_match: kr.get_exclude_from_match(),
+        })
+                                  })
+                                  .collect());
+
+    if pkinfo.len() != 1 || pkinfo[0].exclude_match {
+        unimplemented!();
+    }
+
+    Ok(MergeTableInfo {
+        table_id: ltcr.get_table_id(),
+        keys: pkinfo,
+        columns: columns,
+    })
+}
+
 fn merge_levels_table<'a>(mut out_t: level_table_change::Builder<'a>,
+                          fst_pin: &ValuePin,
                           fst_t: level_table_change::Reader<'a>,
+                          snd_pin: &ValuePin,
                           snd_t: level_table_change::Reader<'a>)
                           -> Result<()> {
     if snd_t.get_dropped() {
@@ -167,109 +240,111 @@ fn merge_levels_table<'a>(mut out_t: level_table_change::Builder<'a>,
     // snd is now known to be created & !dropped
 
     if !fst_t.get_created() {
-        // starting from blankness
-        try!(copy_table_change(out_t.borrow(), snd_t));
-        out_t.set_dropped(fst_t.get_dropped());
-        return Ok(());
+        return Err(Error::MergeUpdateNotExists);
     }
 
     // at this point we are known to be merging creates
     out_t.set_dropped(fst_t.get_dropped());
     out_t.set_created(true);
     out_t.set_table_id(fst_t.get_table_id());
-    out_t.set_key_count(1);
 
-    let nkeys = 1;
-    let table_id = fst_t.get_table_id();
-    if fst_t.get_key_count() != 1 || snd_t.get_key_count() != 1 {
-        unimplemented!();
+    let p1 = try!(parse_merge_table(fst_pin, fst_t));
+    let p2 = try!(parse_merge_table(snd_pin, snd_t));
+
+    // try to align the two column sets
+
+    let mut alignment: Vec<(u32, Option<Option<Vec<u8>>>, Column, Column)> = Vec::new();
+
+    for col2 in p2.columns.values() {
+        let (erase, lvec) = match col2.erase {
+            None => {
+                let col1 = try!(p1.columns.get(&col2.low_id).ok_or(Error::MergeUpdateColNotExists));
+                (col1.erase.clone(), col1.data.clone())
+            }
+            Some(ref er2) => {
+                (Some(er2.clone()),
+                 try!(vector::constant(er2.clone(), p1.keys[0].upsert_key.len())))
+            }
+        };
+
+        alignment.push((col2.low_id, erase, lvec, col2.data.clone()));
     }
 
-    if fst_t.has_match_keys() || snd_t.has_match_keys() {
-        // this is for upserts to secondary indices...note that the secondary index design is
-        // kinda meh since it should be packed
-        unimplemented!();
-    }
+    let dead_keys = try!(vector::sorted_merge((&p2.keys[0].upsert_key, &p2.keys[0].delete_key),
+                                              &[(&p2.keys[0].upsert_key, &p2.keys[0].delete_key)]));
+    let left_refs: Vec<&Column> = Some(&p1.keys[0].upsert_key)
+                                      .into_iter()
+                                      .chain(alignment.iter().map(|tp| &tp.2))
+                                      .collect();
+    let filtered_left = try!(vector::sorted_semijoin(&p1.keys[0].upsert_key,
+                                                     &dead_keys[0],
+                                                     &*left_refs,
+                                                     true));
+    let filtered_del = try!(vector::sorted_semijoin(&p1.keys[0].delete_key,
+                                                    &dead_keys[0],
+                                                    &[&p1.keys[0].delete_key],
+                                                    true));
 
-    let fst_co = try!(fst_t.get_column_order());
-    let snd_co = try!(snd_t.get_column_order());
-    let fst_cd = try!(fst_t.get_columns_deleted());
-    let snd_cd = try!(snd_t.get_columns_deleted());
-    let fst_ud = try!(fst_t.get_upsert_data());
-    let snd_ud = try!(snd_t.get_upsert_data());
-    let fst_dd = try!(fst_t.get_delete_data());
-    let snd_dd = try!(snd_t.get_delete_data());
+    let new_del = try!(vector::sorted_merge((&filtered_del[0], &p2.keys[0].delete_key),
+                                            &[(&filtered_del[0], &p2.keys[0].delete_key)]));
+    let ups_ref: Vec<_> = filtered_left.iter()
+                                       .zip(Some(&p2.keys[0].upsert_key)
+                                                .into_iter()
+                                                .chain(alignment.iter().map(|tp| &tp.3)))
+                                       .collect();
+    let new_ups = try!(vector::sorted_merge((&filtered_left[0], &p2.keys[0].upsert_key),
+                                            &*ups_ref));
 
-    if fst_ud.len() != nkeys + fst_co.len() {
-        return Err(Error::WrongVecLen);
-    }
+    let new_keys = vec![
+        MergePkInfo {
+            upsert_key: new_ups[0].clone(), delete_key: new_del[0].clone(), exclude_match: false
+        },
+    ];
+    let new_columns = alignment.iter()
+                               .zip((&new_ups[1..]).into_iter())
+                               .map(|(&(low_id, ref erase, _, _), data)| {
+                                   MergeColumnInfo {
+                                       low_id: low_id,
+                                       erase: erase.clone(),
+                                       data: data.clone(),
+                                   }
+                               });
 
-    if fst_dd.len() != nkeys {
-        return Err(Error::WrongVecLen);
-    }
-
-    if snd_ud.len() != nkeys + snd_co.len() {
-        return Err(Error::WrongVecLen);
-    }
-
-    if snd_dd.len() != nkeys {
-        return Err(Error::WrongVecLen);
-    }
-
-    let mut col_del_set = HashSet::new();
-    let mut col_left_data = HashMap::new();
-    let mut col_right_data = HashMap::new();
-    let mut stale_col = HashSet::new();
-
-    for (colix, colid) in misc::prim_list_iter(fst_co).enumerate() {
-        if col_left_data.insert(colid, fst_ud.index_move(colix as u32 + nkeys)).is_some() {
-            return Err(Error::MergeDupDelCol(table_id, colid));
+    {
+        let mut pkey_w = out_t.borrow().init_primary_keys(new_keys.len() as u32);
+        for (pkey_ix, pkeyi) in new_keys.into_iter().enumerate() {
+            let mut pkeyi_w = pkey_w.borrow().get(pkey_ix as u32);
+            pkeyi_w.set_exclude_from_match(pkeyi.exclude_match);
+            let seru = try!(vector::serialized(&pkeyi.upsert_key));
+            pkeyi_w.set_upsert_bits(&seru);
+            let serd = try!(vector::serialized(&pkeyi.delete_key));
+            pkeyi_w.set_delete_bits(&serd);
         }
-        stale_col.insert(colid);
     }
 
-    for delid in misc::prim_list_iter(fst_cd) {
-        if !col_left_data.contains_key(&delid) {
-            return Err(Error::MergeDelNotIns(table_id, delid));
-        }
-        if col_del_set.insert(delid) {
-            return Err(Error::MergeDupInsCol(table_id, delid));
-        }
-    }
-
-    // TODO(now): need to add column default value data to the column order so that we can
-    // appropriately materialize the new columns
-    for (colix, colid) in misc::prim_list_iter(snd_co).enumerate() {
-        if col_right_data.insert(colid, fst_ud.index_move(colix as u32 + nkeys)).is_some() {
-            return Err(Error::MergeDupInsCol(table_id, colid));
-        }
-        if col_left_data.contains_key(&colid) {
-            stale_col.remove(&colid);
-        } else {
-            col_left_data.insert(colid, unimplemented!());
+    {
+        let mut cols_w = out_t.borrow().init_upsert_data(new_columns.len() as u32);
+        for (cols_ix, coli) in new_columns.into_iter().enumerate() {
+            let mut coli_w = cols_w.borrow().get(cols_ix as u32);
+            coli_w.set_low_id(coli.low_id);
+            if let Some(er) = coli.erase {
+                coli_w.set_erased(true);
+                if let Some(bits) = er {
+                    coli_w.set_default(&bits);
+                }
+            }
+            let serv = try!(vector::serialized(&coli.data));
+            coli_w.set_data(&serv);
         }
     }
 
-    for colid in stale_col {
-        col_left_data.remove(&colid);
-        col_del_set.remove(&colid);
-    }
-
-    assert!(col_left_data.keys().eq(col_right_data.keys()));
-
-    for delid in misc::prim_list_iter(snd_cd) {
-        if !col_left_data.contains_key(&delid) {
-            return Err(Error::MergeDelNotMatched(table_id, delid));
-        }
-        col_del_set.insert(delid);
-        col_left_data.insert(delid, unimplemented!());
-    }
-
-    unimplemented!()
+    Ok(())
 }
 
 fn merge_levels_tc<'a>(out_lp: level::Builder<'a>,
+                       fst_pin: &ValuePin,
                        fst_l: struct_list::Reader<'a, level_table_change::Owned>,
+                       snd_pin: &ValuePin,
                        snd_l: struct_list::Reader<'a, level_table_change::Owned>)
                        -> Result<()> {
     // TODO(someday): This pass would be unneeded if we had an orphanage
@@ -290,7 +365,7 @@ fn merge_levels_tc<'a>(out_lp: level::Builder<'a>,
             misc::MergeRow::Left(table_l) => try!(copy_table_change(out_change_p, table_l)),
             misc::MergeRow::Right(table_r) => try!(copy_table_change(out_change_p, table_r)),
             misc::MergeRow::Match(table_l, table_r) => {
-                try!(merge_levels_table(out_change_p, table_l, table_r));
+                try!(merge_levels_table(out_change_p, fst_pin, table_l, snd_pin, table_r));
             }
         }
     }
@@ -307,6 +382,12 @@ impl From<capnp::Error> for Error {
 impl From<persist::Error> for Error {
     fn from(err: persist::Error) -> Error {
         Error::Persist(err)
+    }
+}
+
+impl From<vector::Error> for Error {
+    fn from(err: vector::Error) -> Error {
+        Error::Vector(err)
     }
 }
 
@@ -364,7 +445,7 @@ impl Transaction {
         Ok(())
     }
 
-    pub fn create_table(&mut self, options: TableCreateOptions) -> Result<u64> {
+    pub fn create_table(&mut self, _options: TableCreateOptions) -> Result<u64> {
         let mut highwater = 0;
         for_level!(self, level_r in {
             let level_reader = try!(level_r.get_level_ptr());
@@ -384,8 +465,17 @@ impl Transaction {
             let level_b = message_b.init_root::<level::Builder>();
             let mut tc_b = level_b.init_tables_changed(1).get(0);
             tc_b.set_created(true);
+            tc_b.set_dropped(true);
             tc_b.set_table_id(highwater + 1);
-            tc_b.set_key_count(options.key_count);
+            tc_b.borrow().init_upsert_data(0);
+            {
+                let mut pk_lb = tc_b.borrow().init_primary_keys(1);
+                let mut pk_b = pk_lb.borrow().get(0);
+                let empty_vec = try!(vector::constant(None, 0));
+                let empty_data = try!(vector::serialized(&empty_vec));
+                pk_b.set_upsert_bits(&empty_data);
+                pk_b.set_delete_bits(&empty_data);
+            }
         }
         try!(self.push_uncommitted_level(&message_b));
         Ok(highwater + 1)

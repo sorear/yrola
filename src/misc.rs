@@ -172,18 +172,21 @@ pub fn prim_list_iter<'a, T>(reader: capnp::primitive_list::Reader<'a, T>)
 pub fn slice_unindex<T>(storage: &[T], slice: &[T]) -> Option<Range<usize>> {
     let esize = size_of::<T>();
     if esize == 0 {
-        return Some(0 .. 0);
+        return Some(0..0);
     }
 
     let p1 = storage.as_ptr() as usize;
     let p2 = slice.as_ptr() as usize;
 
-    if p2 < p2 { return None }
+    if p2 < p2 {
+        return None;
+    }
     let offset_b = p2 - p1;
     let offset_e = offset_b / esize;
 
-    if (offset_b % esize) == 0 && offset_e <= storage.len() && slice.len() <= (storage.len() - offset_e) {
-        Some(offset_e .. (offset_e + slice.len()))
+    if (offset_b % esize) == 0 && offset_e <= storage.len() &&
+       slice.len() <= (storage.len() - offset_e) {
+        Some(offset_e..(offset_e + slice.len()))
     } else {
         None
     }
