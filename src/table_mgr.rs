@@ -15,6 +15,13 @@ use std::u64;
 use vector::{self, Column};
 use yrola_capnp::{level, bundle, level_table_change};
 
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+pub struct TableId(pub u64);
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+pub struct Timestamp(pub u64);
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+pub struct ColumnId(pub u32);
+
 // a levelhandle does NOT know its own place...
 #[derive(Clone)]
 struct LevelHandle {
@@ -30,7 +37,7 @@ struct LevelReader {
 }
 
 pub struct Transaction {
-    start_stamp: u64,
+    start_stamp: Timestamp,
     committed: Vec<LevelHandle>,
     uncommitted: Vec<LevelHandle>,
 }
@@ -50,16 +57,16 @@ pub enum Error {
     DbTooOld(u32),
     DbTooNew(u32),
     WrongApp(String),
-    NoSuchTable(u64),
+    NoSuchTable(TableId),
     TableIdsExhausted,
-    MergePkeyMismatch(u64, u32, u32),
+    MergePkeyMismatch(TableId, u32, u32),
     // TODO(soon): need a way to identify levels
     // TODO(soon): merge does not own this logic
-    MergeDupCol(u64, u32),
-    MergeDupDelCol(u64, u32),
-    MergeDupInsCol(u64, u32),
-    MergeDelNotIns(u64, u32),
-    MergeDelNotMatched(u64, u32),
+    MergeDupCol(TableId, ColumnId),
+    MergeDupDelCol(TableId, ColumnId),
+    MergeDupInsCol(TableId, ColumnId),
+    MergeDelNotIns(TableId, ColumnId),
+    MergeDelNotMatched(TableId, ColumnId),
     WrongVecLen,
     MergeUpdateNotExists,
     MergeUpdateColNotExists,
@@ -103,11 +110,11 @@ impl LevelReader {
         }
     }
 
-    fn get_table_ptr<'a>(&'a self, table_id: u64) -> Result<level_table_change::Reader<'a>> {
+    fn get_table_ptr<'a>(&'a self, table_id: TableId) -> Result<level_table_change::Reader<'a>> {
         let level_reader = try!(self.get_level_ptr());
         let changed_reader = try!(level_reader.get_tables_changed());
         match misc::binary_search_index(changed_reader.len() as usize, |ix| {
-            changed_reader.clone().get(ix as u32).get_table_id().cmp(&table_id)
+            changed_reader.clone().get(ix as u32).get_table_id().cmp(&table_id.0)
         }) {
             Ok(ix) => Ok(changed_reader.clone().get(ix as u32)),
             Err(_) => Ok(null_table_change()),
@@ -156,7 +163,7 @@ fn copy_table_change<'a>(mut out: level_table_change::Builder<'a>,
 }
 
 struct MergeColumnInfo {
-    low_id: u32,
+    low_id: ColumnId,
     erase: Option<Option<Vec<u8>>>,
     data: Column,
 }
@@ -168,22 +175,24 @@ struct MergePkInfo {
 }
 
 struct MergeTableInfo {
-    table_id: u64,
+    table_id: TableId,
     keys: Vec<MergePkInfo>,
-    columns: HashMap<u32, MergeColumnInfo>,
+    columns: HashMap<ColumnId, MergeColumnInfo>,
 }
 
 fn parse_merge_table<'a>(pin: &ValuePin,
                          ltcr: level_table_change::Reader<'a>,
-                         filter: Option<&HashSet<u32>>)
+                         filter: Option<&HashSet<ColumnId>>)
                          -> Result<MergeTableInfo> {
     let mut columns = HashMap::new();
+    let table_id = TableId(ltcr.get_table_id());
     for lcolr in try!(ltcr.get_upsert_data()).iter() {
-        if columns.contains_key(&lcolr.get_low_id()) {
-            return Err(Error::MergeDupCol(ltcr.get_table_id(), lcolr.get_low_id()));
+        let col_id = ColumnId(lcolr.get_low_id());
+        if columns.contains_key(&col_id) {
+            return Err(Error::MergeDupCol(table_id, col_id));
         }
         if let Some(filter_h) = filter {
-            if filter_h.contains(&lcolr.get_low_id()) {
+            if filter_h.contains(&col_id) {
                 continue;
             }
         }
@@ -197,9 +206,9 @@ fn parse_merge_table<'a>(pin: &ValuePin,
         } else {
             None
         };
-        columns.insert(lcolr.get_low_id(),
+        columns.insert(col_id,
                        MergeColumnInfo {
-                           low_id: lcolr.get_low_id(),
+                           low_id: col_id,
                            erase: erase,
                            data: try!(vector::parse(pin.clone(), try!(lcolr.get_data()))),
                        });
@@ -221,14 +230,14 @@ fn parse_merge_table<'a>(pin: &ValuePin,
     }
 
     Ok(MergeTableInfo {
-        table_id: ltcr.get_table_id(),
+        table_id: table_id,
         keys: pkinfo,
         columns: columns,
     })
 }
 
 fn merge_table_view(p1: MergeTableInfo, p2: MergeTableInfo) -> Result<MergeTableInfo> {
-    let mut alignment: Vec<(u32, Option<Option<Vec<u8>>>, Column, Column)> = Vec::new();
+    let mut alignment: Vec<(ColumnId, Option<Option<Vec<u8>>>, Column, Column)> = Vec::new();
 
     for col2 in p2.columns.values() {
         let (erase, lvec) = match col2.erase {
@@ -345,7 +354,7 @@ fn merge_levels_table<'a>(mut out_t: level_table_change::Builder<'a>,
         let mut cols_w = out_t.borrow().init_upsert_data(p12.columns.len() as u32);
         for (cols_ix, (_, coli)) in p12.columns.into_iter().enumerate() {
             let mut coli_w = cols_w.borrow().get(cols_ix as u32);
-            coli_w.set_low_id(coli.low_id);
+            coli_w.set_low_id(coli.low_id.0);
             if let Some(er) = coli.erase {
                 coli_w.set_erased(true);
                 if let Some(bits) = er {
@@ -446,14 +455,14 @@ impl Transaction {
         log
     }
 
-    fn table_exists(&self, table_id: u64) -> Result<bool> {
+    fn table_exists(&self, table_id: TableId) -> Result<bool> {
         for_table!(self, table_id, _level_pin, table_r in {
             return Ok(true);
         });
         return Ok(false);
     }
 
-    fn materialize(&self, table_id: u64, cols: &HashSet<u32>) -> Result<MergeTableInfo> {
+    fn materialize(&self, table_id: TableId, cols: &HashSet<ColumnId>) -> Result<MergeTableInfo> {
         let mut layers = Vec::new();
         for_table!(self, table_id, level_pin, table_r in {
             layers.push(try!(parse_merge_table(level_pin, table_r, Some(cols))));
@@ -490,7 +499,7 @@ impl Transaction {
         Ok(())
     }
 
-    pub fn create_table(&mut self, _options: TableCreateOptions) -> Result<u64> {
+    pub fn create_table(&mut self, _options: TableCreateOptions) -> Result<TableId> {
         let mut highwater = 0;
         for_level!(self, level_r in {
             let level_reader = try!(level_r.get_level_ptr());
@@ -523,10 +532,10 @@ impl Transaction {
             }
         }
         try!(self.push_uncommitted_level(&message_b));
-        Ok(highwater + 1)
+        Ok(TableId(highwater + 1))
     }
 
-    pub fn drop_table(&mut self, id: u64) -> Result<()> {
+    pub fn drop_table(&mut self, id: TableId) -> Result<()> {
         if !try!(self.table_exists(id)) {
             return Err(Error::NoSuchTable(id));
         }
@@ -536,7 +545,7 @@ impl Transaction {
             let level_b = message_b.init_root::<level::Builder>();
             let mut tc_b = level_b.init_tables_changed(1).get(0);
             tc_b.set_dropped(true);
-            tc_b.set_table_id(id);
+            tc_b.set_table_id(id.0);
         }
         try!(self.push_uncommitted_level(&message_b));
         Ok(())
@@ -591,7 +600,7 @@ impl Connection {
         }
 
         Transaction {
-            start_stamp: 1,
+            start_stamp: Timestamp(1),
             committed: Vec::new(),
             uncommitted: Vec::new(),
         }

@@ -21,12 +21,17 @@ macro_rules! trace {
     ( $( $any:tt )* ) => ( )
 }
 
+#[derive(Debug, Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct ObjectId(pub u64);
+#[derive(Clone, Copy, Hash, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SegmentId(pub u64);
+
 #[derive(Debug)]
 pub enum Error {
     Corrupt(Corruption, PathBuf),
     Io(IoType, PathBuf, io::Error),
     Exhausted(Exhaustion),
-    NotFound(u64),
+    NotFound(ObjectId),
     Disconnected,
 }
 
@@ -76,11 +81,11 @@ pub enum Corruption {
     MissingSegmentHeader,
     CapnpError(capnp::Error),
     DupObject {
-        id: u64,
+        id: ObjectId,
         other_file: PathBuf,
     },
     DupTombstone {
-        id: u64,
+        id: ObjectId,
         other_file: PathBuf,
     },
     UnclosedSegment {
@@ -96,12 +101,12 @@ pub type Result<T> = result::Result<T, Error>;
 
 struct ObjDirControl {
     base_dir: PathBuf,
-    delete_queue: Mutex<Vec<u64>>,
+    delete_queue: Mutex<Vec<ObjectId>>,
 }
 
 struct FileControl {
     dir_control: Arc<ObjDirControl>,
-    id: u64,
+    id: ObjectId,
     size: u64,
     hash: u64,
     loaded_data: Mutex<Option<Arc<Vec<u8>>>>,
@@ -124,18 +129,18 @@ pub struct ValuePin {
 
 #[derive(Clone)]
 pub struct ItemHandle {
-    id: u64,
+    id: ObjectId,
     header: Arc<Vec<u8>>,
     body: ValueHandle,
 }
 
 struct ObjectInfo {
-    segment_id: u64,
+    segment_id: SegmentId,
     data: ItemHandle,
 }
 
 struct TombstoneInfo {
-    segment_id: u64,
+    segment_id: SegmentId,
 }
 
 #[derive(Clone)]
@@ -144,11 +149,11 @@ struct SegmentInfo {
     // dead tombstones have no such requirement.
     //
     // must exist in .objects
-    live_object_ids: HashSet<u64>,
+    live_object_ids: HashSet<ObjectId>,
     // must not exist in .objects, must exist in .tombstones
-    dead_object_ids: HashSet<u64>,
+    dead_object_ids: HashSet<ObjectId>,
     // must not exist in .objects, must exist in .tombstones
-    live_tombstone_ids: HashSet<u64>,
+    live_tombstone_ids: HashSet<ObjectId>,
 
     // not valid for the open segment
     on_disk_size: u64,
@@ -157,7 +162,7 @@ struct SegmentInfo {
 }
 
 struct OpenSegmentInfo {
-    id: u64,
+    id: SegmentId,
     handle: File,
     path: PathBuf,
     offset: u64,
@@ -184,15 +189,15 @@ pub struct Connection {
     lock_file: File,
 
     dir_control: Arc<ObjDirControl>,
-    segments: HashMap<u64, SegmentInfo>,
+    segments: HashMap<SegmentId, SegmentInfo>,
     // objects and tombstones are live only (after initial journal read)
-    objects: HashMap<u64, ObjectInfo>,
-    tombstones: HashMap<u64, TombstoneInfo>,
-    highwater_object_id: u64,
-    highwater_segment_id: u64,
+    objects: HashMap<ObjectId, ObjectInfo>,
+    tombstones: HashMap<ObjectId, TombstoneInfo>,
+    highwater_object_id: ObjectId,
+    highwater_segment_id: SegmentId,
     open_segment: Option<OpenSegmentInfo>,
     config: JournalConfig,
-    pending_delete_segment: Vec<u64>,
+    pending_delete_segment: Vec<SegmentId>,
 
     live_size: u64,
     on_disk_size: u64,
@@ -200,8 +205,8 @@ pub struct Connection {
 
 pub struct Transaction<'a> {
     journal: &'a mut Connection,
-    new_items: HashMap<u64, ItemHandle>,
-    del_items: HashSet<u64>,
+    new_items: HashMap<ObjectId, ItemHandle>,
+    del_items: HashSet<ObjectId>,
     new_config: Option<JournalConfig>,
     large_objects: Vec<(File, PathBuf, ValueHandle)>,
 }
@@ -299,7 +304,7 @@ impl ValueHandle {
         }
     }
 
-    fn new_external(dir: Arc<ObjDirControl>, id: u64, size: u64, hash: u64) -> ValueHandle {
+    fn new_external(dir: Arc<ObjDirControl>, id: ObjectId, size: u64, hash: u64) -> ValueHandle {
         let fc = Arc::new(FileControl {
             dir_control: dir,
             id: id,
@@ -321,7 +326,7 @@ impl ValueHandle {
                     return Ok(ValuePin { data: data.clone() });
                 }
 
-                let path = fl.dir_control.base_dir.join(format!("{:06}", fl.id));
+                let path = fl.dir_control.base_dir.join(format!("{:06}", fl.id.0));
                 let mut buf = Vec::new();
                 let mut fileh = try!(wrap_io(&path, IoType::ObjectOpen, File::open(&path)));
                 try!(wrap_io(&path, IoType::ObjectRead, fileh.read_to_end(&mut buf)));
@@ -346,7 +351,7 @@ impl Borrow<[capnp::Word]> for ValuePin {
 }
 
 impl ItemHandle {
-    pub fn id(&self) -> u64 {
+    pub fn id(&self) -> ObjectId {
         self.id
     }
 
@@ -368,9 +373,9 @@ impl ItemHandle {
 }
 
 pub struct ItemIterator<'a> {
-    new_iter: ::std::collections::hash_map::Values<'a, u64, ItemHandle>,
-    existing_iter: ::std::collections::hash_map::Values<'a, u64, ObjectInfo>,
-    deleted: &'a HashSet<u64>,
+    new_iter: ::std::collections::hash_map::Values<'a, ObjectId, ItemHandle>,
+    existing_iter: ::std::collections::hash_map::Values<'a, ObjectId, ObjectInfo>,
+    deleted: &'a HashSet<ObjectId>,
     new_iter_done: bool,
     existing_iter_done: bool,
 }
@@ -400,8 +405,8 @@ impl<'a> Iterator for ItemIterator<'a> {
 }
 
 impl<'a> Transaction<'a> {
-    pub fn add_item(&mut self, header: Vec<u8>, data: Vec<u8>) -> Result<u64> {
-        if self.journal.highwater_object_id == u64::MAX {
+    pub fn add_item(&mut self, header: Vec<u8>, data: Vec<u8>) -> Result<ObjectId> {
+        if self.journal.highwater_object_id == ObjectId(u64::MAX) {
             return Err(Error::Exhausted(Exhaustion::ObjectId));
         }
 
@@ -409,7 +414,7 @@ impl<'a> Transaction<'a> {
             return Err(Error::Exhausted(Exhaustion::HeaderSize(header.len(), MAX_HEADER_LEN)));
         }
 
-        self.journal.highwater_object_id += 1;
+        self.journal.highwater_object_id.0 += 1;
         let id = self.journal.highwater_object_id;
 
         if data.len() > MAX_INLINE_LEN {
@@ -444,7 +449,7 @@ impl<'a> Transaction<'a> {
         Ok(id)
     }
 
-    pub fn del_item(&mut self, id: u64) -> Result<()> {
+    pub fn del_item(&mut self, id: ObjectId) -> Result<()> {
         if self.new_items.remove(&id).is_some() {
             Ok(())
         } else if self.journal.objects.contains_key(&id) && !self.del_items.contains(&id) {
@@ -455,7 +460,7 @@ impl<'a> Transaction<'a> {
         }
     }
 
-    pub fn get_item(&mut self, id: u64) -> Result<&ItemHandle> {
+    pub fn get_item(&mut self, id: ObjectId) -> Result<&ItemHandle> {
         if let Some(ref_ith) = self.new_items.get(&id) {
             return Ok(ref_ith);
         }
@@ -526,7 +531,7 @@ impl<'a> Transaction<'a> {
                     }
                     let mut nin_builder = (&mut inline_builder).borrow().get(inline_ix);
                     inline_ix += 1;
-                    nin_builder.set_id(*obj_id);
+                    nin_builder.set_id(obj_id.0);
                     nin_builder.set_header(&*item_hdl.header);
                     match item_hdl.body.0 {
                         ValueImp::Small(ref body) => {
@@ -556,7 +561,7 @@ impl<'a> Transaction<'a> {
                     }
                     let mut nex_builder = (&mut extern_builder).borrow().get(extern_ix);
                     extern_ix += 1;
-                    nex_builder.set_id(*obj_id);
+                    nex_builder.set_id(obj_id.0);
                     nex_builder.set_header(&*item_hdl.header);
                     match item_hdl.body.0 {
                         ValueImp::Small(_) => unreachable!(),
@@ -575,7 +580,7 @@ impl<'a> Transaction<'a> {
                 let mut ts_ix = 0;
 
                 for ts_id in &self.del_items {
-                    ts_builder.set(ts_ix, *ts_id);
+                    ts_builder.set(ts_ix, ts_id.0);
                     ts_ix += 1;
                 }
             }
@@ -674,24 +679,24 @@ const LEADER_K1: u64 = 0x520c5e4629fdf1b0;
 const EXTERNAL_K0: u64 = 0xae880699c0628ab8;
 const EXTERNAL_K1: u64 = 0x3f9c216ed189d0f3;
 
-fn leader_hash(segment_id: u64, segment_offset: u64, leader: u32) -> u32 {
+fn leader_hash(segment_id: SegmentId, segment_offset: u64, leader: u32) -> u32 {
     let mut hasher = SipHasher::new_with_keys(LEADER_K0, LEADER_K1);
-    hasher.write_u64(segment_id);
+    hasher.write_u64(segment_id.0);
     hasher.write_u64(segment_offset);
     hasher.write_u32(leader);
     hasher.finish() as u32
 }
 
-fn external_hash(file_id: u64, data: &[u8]) -> u64 {
+fn external_hash(file_id: ObjectId, data: &[u8]) -> u64 {
     let mut hasher = SipHasher::new_with_keys(EXTERNAL_K0, EXTERNAL_K1);
-    hasher.write_u64(file_id);
+    hasher.write_u64(file_id.0);
     hasher.write(data);
     hasher.finish()
 }
 
-fn log_block_hash(segment_id: u64, segment_position: u64, data: &[u8]) -> u64 {
+fn log_block_hash(segment_id: SegmentId, segment_position: u64, data: &[u8]) -> u64 {
     let mut hasher = SipHasher::new_with_keys(BLOCK_K0, BLOCK_K1);
-    hasher.write_u64(segment_id);
+    hasher.write_u64(segment_id.0);
     hasher.write_u64(segment_position);
     hasher.write(data);
     hasher.finish()
@@ -699,7 +704,7 @@ fn log_block_hash(segment_id: u64, segment_position: u64, data: &[u8]) -> u64 {
 
 fn read_log_blocks_file(mut segment: File,
                         segment_path: &PathBuf,
-                        segment_id: u64)
+                        segment_id: SegmentId)
                         -> Result<(LogBlockError, u64, Vec<Vec<capnp::Word>>)> {
     let mut jdata = Vec::new();
     try!(wrap_io(&segment_path,
@@ -753,7 +758,7 @@ fn read_log_blocks_file(mut segment: File,
 
 fn write_log_block(segment: &mut File,
                    segment_path: &PathBuf,
-                   segment_id: u64,
+                   segment_id: SegmentId,
                    segment_position: &mut u64,
                    block: &[capnp::Word])
                    -> Result<()> {
@@ -873,8 +878,8 @@ impl Connection {
             segments: HashMap::new(),
             objects: HashMap::new(),
             tombstones: HashMap::new(),
-            highwater_object_id: 0,
-            highwater_segment_id: 0,
+            highwater_object_id: ObjectId(0),
+            highwater_segment_id: SegmentId(0),
             open_segment: None,
             dir_control: Arc::new(ObjDirControl::new(&objs_path)),
             pending_delete_segment: Vec::new(),
@@ -893,18 +898,18 @@ impl Connection {
         Ok(pers)
     }
 
-    fn segment_path(&self, id: u64) -> PathBuf {
-        self.segs_path.join(format!("{:06}", id))
+    fn segment_path(&self, id: SegmentId) -> PathBuf {
+        self.segs_path.join(format!("{:06}", id.0))
     }
 
-    fn object_path(&self, id: u64) -> PathBuf {
-        self.objs_path.join(format!("{:06}", id))
+    fn object_path(&self, id: ObjectId) -> PathBuf {
+        self.objs_path.join(format!("{:06}", id.0))
     }
 
     fn read_segment(&mut self,
-                    segment_id: u64,
+                    segment_id: SegmentId,
                     closed_segment: bool,
-                    mut list_out: Option<&mut HashSet<u64>>)
+                    mut list_out: Option<&mut HashSet<SegmentId>>)
                     -> Result<(bool, u64, u32)> {
         let jpath = self.segment_path(segment_id);
         let jfile = try!(wrap_io(&jpath, IoType::SegmentOpen, File::open(&jpath)));
@@ -954,12 +959,13 @@ impl Connection {
                                                   jpath.clone()));
                     }
                     saw_header = true;
-                    self.highwater_object_id = cmp::max(self.highwater_object_id,
-                                                        seg_hdr.get_highest_ever_item_id());
+                    self.highwater_object_id =
+                        cmp::max(self.highwater_object_id,
+                                 ObjectId(seg_hdr.get_highest_ever_item_id()));
                     let list_r = try!(wrap_capnp(&jpath, seg_hdr.get_previous_segment_ids()));
                     if let Some(ref mut id_set) = list_out {
                         for ix in 0..list_r.len() {
-                            id_set.insert(list_r.get(ix));
+                            id_set.insert(SegmentId(list_r.get(ix)));
                         }
                     }
 
@@ -974,7 +980,7 @@ impl Connection {
                     for newi_r in newi_rr.iter() {
                         let hdr = try!(wrap_capnp(&jpath, newi_r.get_header()));
                         try!(self.load_object(segment_id, ItemHandle {
-                            id: newi_r.get_id(),
+                            id: ObjectId(newi_r.get_id()),
                             header: Arc::new(Vec::from(hdr)),
                             body: ValueHandle::new(try!(wrap_capnp(&jpath, newi_r.get_data()))),
                         }));
@@ -986,11 +992,11 @@ impl Connection {
                         let dc = self.dir_control.clone();
                         let hdr = try!(wrap_capnp(&jpath, newe_r.get_header()));
                         try!(self.load_object(segment_id, ItemHandle {
-                            id: newe_r.get_id(),
+                            id: ObjectId(newe_r.get_id()),
                             header: Arc::new(Vec::from(hdr)),
                             body: ValueHandle::new_external(
                                 dc,
-                                newe_r.get_id(),
+                                ObjectId(newe_r.get_id()),
                                 newe_r.get_size(),
                                 newe_r.get_hash(),
                             )
@@ -1001,13 +1007,13 @@ impl Connection {
                     change_counter += del_r.len();
                     for ix in 0..del_r.len() {
                         let del_id = del_r.get(ix);
-                        try!(self.load_tombstone(segment_id, del_id));
+                        try!(self.load_tombstone(segment_id, ObjectId(del_id)));
                     }
 
                     let obs_r = try!(wrap_capnp(&jpath, commit.get_obsolete_segment_ids()));
                     if let Some(ref mut id_set) = list_out {
                         for ix in 0..obs_r.len() {
-                            id_set.remove(&obs_r.get(ix));
+                            id_set.remove(&SegmentId(obs_r.get(ix)));
                         }
                     }
 
@@ -1050,7 +1056,7 @@ impl Connection {
         Ok(())
     }
 
-    fn load_object(&mut self, segment_id: u64, objh: ItemHandle) -> Result<()> {
+    fn load_object(&mut self, segment_id: SegmentId, objh: ItemHandle) -> Result<()> {
         let object_id = objh.id();
         trace!("load object {:?} {:?}", segment_id, object_id);
         self.highwater_object_id = cmp::max(self.highwater_object_id, object_id);
@@ -1076,7 +1082,7 @@ impl Connection {
         Ok(())
     }
 
-    fn load_tombstone(&mut self, segment_id: u64, object_id: u64) -> Result<()> {
+    fn load_tombstone(&mut self, segment_id: SegmentId, object_id: ObjectId) -> Result<()> {
         trace!("load tombstone {:?} {:?}", segment_id, object_id);
         if let Some(old) = self.tombstones.get(&object_id) {
             return Err(Error::Corrupt(Corruption::DupTombstone {
@@ -1104,7 +1110,7 @@ impl Connection {
         for rentry in segs_iter {
             let entry = try!(wrap_io(&self.segs_path, IoType::SegmentReaddir, rentry));
             if let Some(jnum) = parse_object_filename(&*entry.file_name()) {
-                segment_names.push(jnum);
+                segment_names.push(SegmentId(jnum));
             }
         }
 
@@ -1188,7 +1194,7 @@ impl Connection {
         for rentry in segs_iter {
             let entry = try!(wrap_io(&self.segs_path, IoType::CleanupReaddir, rentry));
             if let Some(jnum) = parse_object_filename(&*entry.file_name()) {
-                if self.segments.contains_key(&jnum) {
+                if self.segments.contains_key(&SegmentId(jnum)) {
                     continue;
                 }
             }
@@ -1204,7 +1210,7 @@ impl Connection {
         for rentry in objs_iter {
             let entry = try!(wrap_io(&self.objs_path, IoType::CleanupReaddir, rentry));
             if let Some(jnum) = parse_object_filename(&*entry.file_name()) {
-                if self.objects.contains_key(&jnum) {
+                if self.objects.contains_key(&ObjectId(jnum)) {
                     continue;
                 }
             }
@@ -1235,7 +1241,7 @@ impl Connection {
     }
 
     // returns the number of the open segment, you're likely to need it
-    fn ensure_open_segment(&mut self, changes: u32) -> Result<u64> {
+    fn ensure_open_segment(&mut self, changes: u32) -> Result<SegmentId> {
         if self.segment_full(changes) {
             // try to write EOF, if it takes, end the segment
             let mut msg_builder = capnp::message::Builder::new_default();
@@ -1256,7 +1262,7 @@ impl Connection {
 
         if self.open_segment.is_none() {
             // open a brand-new segment file
-            if self.highwater_segment_id == u64::MAX {
+            if self.highwater_segment_id == SegmentId(u64::MAX) {
                 return Err(Error::Exhausted(Exhaustion::SegmentId));
             }
 
@@ -1264,7 +1270,7 @@ impl Connection {
                 return Err(Error::Exhausted(Exhaustion::SegmentCount));
             }
 
-            self.highwater_segment_id = self.highwater_segment_id + 1;
+            self.highwater_segment_id.0 += 1;
             let new_seg_id = self.highwater_segment_id;
             let new_seg_path = self.segment_path(new_seg_id);
             let writeh = try!(wrap_io(&new_seg_path,
@@ -1306,13 +1312,13 @@ impl Connection {
                     let mut prev_ix = 0;
                     for prev_seg_id in self.segments.keys() {
                         if *prev_seg_id != open_seg_id {
-                            previd_builder.set(prev_ix, *prev_seg_id);
+                            previd_builder.set(prev_ix, prev_seg_id.0);
                             prev_ix += 1;
                         }
                     }
                 }
 
-                header_builder.set_highest_ever_item_id(self.highwater_object_id);
+                header_builder.set_highest_ever_item_id(self.highwater_object_id.0);
                 self.config.save((&mut header_builder).borrow().init_config());
             }
 
@@ -1398,7 +1404,7 @@ impl Connection {
         Ok(())
     }
 
-    fn evacuate(&mut self, segment_id: u64) -> Result<()> {
+    fn evacuate(&mut self, segment_id: SegmentId) -> Result<()> {
         // TODO(someday): the allocation here is almost certainly avoidable
         let seginfo = self.segments.get(&segment_id).unwrap().clone();
 
@@ -1429,7 +1435,7 @@ impl Connection {
                         ValueImp::Small(ref data) => {
                             let mut nin_builder = (&mut inline_builder).borrow().get(inline_ix);
                             inline_ix += 1;
-                            nin_builder.set_id(obj_data.id);
+                            nin_builder.set_id(obj_data.id.0);
                             nin_builder.set_header(&*obj_data.header);
                             nin_builder.set_data(&*data);
                         }
@@ -1451,7 +1457,7 @@ impl Connection {
                         ValueImp::Large(ref fc) => {
                             let mut nex_builder = (&mut extern_builder).borrow().get(extern_ix);
                             extern_ix += 1;
-                            nex_builder.set_id(obj_data.id);
+                            nex_builder.set_id(obj_data.id.0);
                             nex_builder.set_hash(fc.hash);
                             nex_builder.set_size(fc.size);
                             nex_builder.set_header(&*obj_data.header);
@@ -1466,7 +1472,7 @@ impl Connection {
                                          .init_deleted(seginfo.live_tombstone_ids.len() as u32);
                 let mut ts_ix = 0;
                 for ts_id in &seginfo.live_tombstone_ids {
-                    ts_builder.set(ts_ix, *ts_id);
+                    ts_builder.set(ts_ix, ts_id.0);
                     ts_ix += 1;
                 }
             }
@@ -1475,7 +1481,7 @@ impl Connection {
                 let mut obsseg_builder = (&mut commit_builder)
                                              .borrow()
                                              .init_obsolete_segment_ids(1);
-                obsseg_builder.set(0, segment_id);
+                obsseg_builder.set(0, segment_id.0);
             }
         }
 
